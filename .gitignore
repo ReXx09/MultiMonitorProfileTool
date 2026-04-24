@@ -1,0 +1,12 @@
+# Backup-Dateien
+*.bak
+*.corrupt.*
+
+# Debug-Log
+monitor-debug.log
+
+# VS Code
+.vscode/
+
+# Persoenliche Konfiguration (enthaelt lokale Pfade)
+monitor-profiles.json
