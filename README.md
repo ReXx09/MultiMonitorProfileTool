@@ -1,4 +1,4 @@
-# Multi-Monitor Profile Tool
+# Bockis_Multi-Monitor Tool
 
 **Version 1.1.0** · MIT License · Copyright (c) 2026 ReXx09
 

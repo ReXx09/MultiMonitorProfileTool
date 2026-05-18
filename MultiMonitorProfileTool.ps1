@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Multi-Monitor Profile Tool v1.1.0
+    Bockis_Multi-Monitor Tool v1.1.0
 
 .DESCRIPTION
     WPF-basiertes Tool zur Verwaltung von Multi-Monitor-Layouts unter Windows 10/11.
@@ -37,7 +37,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:Version = '1.1.0'
-$script:AppName = 'Multi-Monitor Profile Tool'
+$script:AppName = 'Bockis_Multi-Monitor Tool'
 
 if (-not $script:IsDotSourced -and [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     Write-Host "Neustart in STA-Modus..."
@@ -1701,7 +1701,7 @@ function Test-IsToolWindowRule {
     )
 
     $ruleTitle = [string]$Title
-    if ([string]::Equals($ruleTitle, 'Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ([string]::Equals($ruleTitle, 'Bockis_Multi-Monitor Tool', [System.StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
 
@@ -1737,7 +1737,7 @@ function Test-IsToolWindowRule {
 
     if (
         ($ruleProcessName -ieq 'powershell' -or $ruleProcessName -ieq 'pwsh' -or $exeName -ieq 'powershell' -or $exeName -ieq 'pwsh') -and
-        [string]::Equals($ruleTitle, 'Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase)
+        [string]::Equals($ruleTitle, 'Bockis_Multi-Monitor Tool', [System.StringComparison]::OrdinalIgnoreCase)
     ) {
         return $true
     }
@@ -1773,7 +1773,7 @@ function Test-IsToolWindowInstance {
         return $true
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($windowTitle) -and $windowTitle.IndexOf('Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    if (-not [string]::IsNullOrWhiteSpace($windowTitle) -and $windowTitle.IndexOf('Bockis_Multi-Monitor Tool', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         return $true
     }
 
@@ -2286,7 +2286,7 @@ function Remove-WindowRuleFromProfile {
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Multi-Monitor Profile Tool" Height="760" Width="1240"
+        Title="Bockis_Multi-Monitor Tool" Height="760" Width="1240"
         WindowStartupLocation="CenterScreen" ResizeMode="CanResize" MinHeight="700" MinWidth="950">
     <Window.Resources>
         <SolidColorBrush x:Key="BgMain" Color="#0B1220"/>
@@ -2385,7 +2385,7 @@ function Remove-WindowRuleFromProfile {
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <TextBlock Grid.Row="0" Text="Multi-Monitor Tool" FontSize="16" FontWeight="SemiBold" Margin="4,2,4,14" TextWrapping="Wrap"/>
+                <TextBlock Grid.Row="0" Text="Bockis_Multi-Monitor Tool" FontSize="16" FontWeight="SemiBold" Margin="4,2,4,14" TextWrapping="Wrap"/>
 
                 <Button x:Name="BtnNavDashboard" Grid.Row="1" Margin="4" Content="Dashboard" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Übersicht: Bildschirme, Schnellaktionen und Aktivitätsprotokoll"/>
                 <Button x:Name="BtnNavEditor" Grid.Row="2" Margin="4" Content="Layout-Editor" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Lege fest, welches Programm auf welchem Monitor in welcher Position starten soll"/>
@@ -2853,14 +2853,14 @@ function Invoke-ApplyProfileLayout {
         Write-Log $summary
 
         if ($FromTray.IsPresent -and $null -ne $script:trayIcon) {
-            $script:trayIcon.ShowBalloonTip(1800, 'Multi-Monitor Profile Tool', "Profil '$ProfileName' wurde angewendet.", [System.Windows.Forms.ToolTipIcon]::Info)
+            $script:trayIcon.ShowBalloonTip(1800, 'Bockis_Multi-Monitor Tool', "Profil '$ProfileName' wurde angewendet.", [System.Windows.Forms.ToolTipIcon]::Info)
         }
     }
     catch {
         $errorMsg = "Profil $ProfileName konnte nicht angewendet werden: $($_.Exception.Message)"
         Write-Log $errorMsg
         if ($FromTray.IsPresent -and $null -ne $script:trayIcon) {
-            $script:trayIcon.ShowBalloonTip(2200, 'Multi-Monitor Profile Tool', $errorMsg, [System.Windows.Forms.ToolTipIcon]::Error)
+            $script:trayIcon.ShowBalloonTip(2200, 'Bockis_Multi-Monitor Tool', $errorMsg, [System.Windows.Forms.ToolTipIcon]::Error)
         }
     }
 }
@@ -2948,7 +2948,7 @@ function Initialize-TrayIcon {
     }
 
     $script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
-    $script:trayIcon.Text = 'Multi-Monitor Profile Tool'
+    $script:trayIcon.Text = 'Bockis_Multi-Monitor Tool'
     $script:trayIcon.Icon = $icon
     $script:trayIcon.ContextMenuStrip = $script:trayContextMenu
     $script:trayIcon.Visible = $true
@@ -2959,7 +2959,7 @@ function Initialize-TrayIcon {
 
 $script:i18n = @{
     de = @{
-        window_title = 'Multi-Monitor Profile Tool'
+        window_title = 'Bockis_Multi-Monitor Tool'
         settings_path_prefix = 'Konfiguration:'
         nav_dashboard = 'Dashboard'
         nav_editor = 'Layout-Editor'
@@ -3007,7 +3007,7 @@ $script:i18n = @{
         log_tool_started = 'Tool gestartet. Tipp: Öffne Hilfe/Tutorial wenn du das Tool zum ersten Mal verwendest.'
     }
     en = @{
-        window_title = 'Multi-Monitor Profile Tool'
+        window_title = 'Bockis_Multi-Monitor Tool'
         settings_path_prefix = 'Configuration:'
         nav_dashboard = 'Dashboard'
         nav_editor = 'Layout Editor'
@@ -3078,7 +3078,7 @@ function T {
 }
 
 function Apply-UiLanguage {
-    $window.Title = T 'window_title'
+    $window.Title = "$($script:AppName)  v$($script:Version)"
 
     $controls.BtnNavDashboard.Content = T 'nav_dashboard'
     $controls.BtnNavEditor.Content = T 'nav_editor'
@@ -4218,7 +4218,7 @@ $window.Add_ContentRendered({
         if ($StartMinimized.IsPresent -and [bool](Get-SafePropertyValue -Object $config.Settings -Name 'StartMinimizedWithWindows' -DefaultValue $false)) {
             Hide-MainWindowToTray
             if ($null -ne $script:trayIcon) {
-                $script:trayIcon.ShowBalloonTip(2400, 'Multi-Monitor Profile Tool', 'Start ohne Profil-Laden. Profile kannst du direkt ueber das Tray-Icon umschalten.', [System.Windows.Forms.ToolTipIcon]::Info)
+                $script:trayIcon.ShowBalloonTip(2400, 'Bockis_Multi-Monitor Tool', 'Start ohne Profil-Laden. Profile kannst du direkt ueber das Tray-Icon umschalten.', [System.Windows.Forms.ToolTipIcon]::Info)
             }
         }
     }
