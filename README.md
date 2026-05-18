@@ -1,5 +1,7 @@
 # Multi-Monitor Profile Tool
 
+**Version 1.1.0** · MIT License · Copyright (c) 2026 ReXx09
+
 Ein PowerShell WPF-Tool zur Verwaltung von Multi-Monitor-Layouts unter Windows 11. Erstelle Profile für verschiedene Setups (z. B. Arbeiten, Streaming, Gaming) und weise jedem Programm eine feste Zone auf einem bestimmten Monitor zu.
 
 ---
@@ -125,4 +127,13 @@ Die Konfiguration wird in `monitor-profiles.json` gespeichert (liegt im gleichen
 
 ## Lizenz
 
-MIT License — frei verwendbar und anpassbar.
+MIT License – frei verwendbar und anpassbar.
+
+Copyright (c) 2026 ReXx09
+
+Hiermit wird unentgeltlich jeder Person, die eine Kopie dieser Software und der zugehörigen
+Dokumentationsdateien erhält, die Erlaubnis erteilt, sie ohne Einschränkung zu nutzen,
+zu kopieren, zu verändern, zusammenzuführen, zu veröffentlichen und weiterzuverbreiten.
+Der obige Urheberrechtsvermerk und dieser Erlaubnisvermerk sind in allen Kopien beizufügen.
+
+https://opensource.org/licenses/MIT

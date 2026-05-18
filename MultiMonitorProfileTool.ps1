@@ -1,13 +1,43 @@
+﻿<#
+.SYNOPSIS
+    Multi-Monitor Profile Tool v1.1.0
+
+.DESCRIPTION
+    WPF-basiertes Tool zur Verwaltung von Multi-Monitor-Layouts unter Windows 10/11.
+    Erstelle Profile, weise Programmen feste Zones auf bestimmten Monitoren zu
+    und stelle Layouts automatisch wieder her.
+
+.VERSION
+    1.1.0
+
+.AUTHOR
+    ReXx09 (https://github.com/ReXx09)
+
+.COPYRIGHT
+    Copyright (c) 2026 ReXx09. Alle Rechte vorbehalten.
+
+.LICENSE
+    MIT License – frei verwendbar und anpassbar.
+    https://opensource.org/licenses/MIT
+
+.LINK
+    https://github.com/ReXx09/MultiMonitorProfileTool
+#>
 param(
-    [string]$ConfigPath = "$PSScriptRoot\monitor-profiles.json"
+    [string]$ConfigPath = "$PSScriptRoot\monitor-profiles.json",
+    [switch]$StartMinimized
 )
 
-# Echter Dot-Source nur wenn InvocationName '.' ist UND PSCommandPath nicht gesetzt
-# (VS Code Debug-Adapter setzt PSCommandPath, obwohl es wie Dot-Source aussieht)
-$script:IsDotSourced = ($MyInvocation.InvocationName -eq '.') -and [string]::IsNullOrWhiteSpace($PSCommandPath)
+# Dot-Sourcing robust erkennen: explizites ". script.ps1" darf nicht die GUI starten.
+$invocationName = [string]$MyInvocation.InvocationName
+$invocationLine = [string]$MyInvocation.Line
+$script:IsDotSourced = ($invocationName -eq '.') -or ($invocationLine -match '^\s*\.\s+')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:Version = '1.1.0'
+$script:AppName = 'Multi-Monitor Profile Tool'
 
 if (-not $script:IsDotSourced -and [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     Write-Host "Neustart in STA-Modus..."
@@ -18,7 +48,10 @@ if (-not $script:IsDotSourced -and [Threading.Thread]::CurrentThread.ApartmentSt
         '-File', "`"$PSCommandPath`"",
         '-ConfigPath', "`"$ConfigPath`""
     )
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $argsList | Out-Null
+    if ($StartMinimized.IsPresent) {
+        $argsList += '-StartMinimized'
+    }
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argsList -WindowStyle Hidden | Out-Null
     return
 }
 
@@ -26,6 +59,7 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
 $signature = @"
 using System;
@@ -359,6 +393,7 @@ function New-DefaultConfig {
             RestoreAfterSwitch = $true
             SwitchDelayMs = 2500
             AutoLaunchMissingWindows = $true
+            PromptBeforeCloseAllWindows = $true
             LaunchDelayMs = 1800
             UiLanguage = 'de'
             DebugLoggingEnabled = $false
@@ -415,7 +450,9 @@ function Save-Config {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -Path $dir -ItemType Directory -Force | Out-Null
     }
-    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    $tmpPath = "$Path.tmp"
+    Set-Content -LiteralPath $tmpPath -Value $json -Encoding UTF8
+    Move-Item -LiteralPath $tmpPath -Destination $Path -Force
 }
 
 function Get-DebugLogPath {
@@ -623,6 +660,34 @@ function Get-Screens {
             WorkingAreaHeight = $s.WorkingArea.Height
         }
     }
+}
+
+function Resolve-ScreenByIdentity {
+    param(
+        [Parameter(Mandatory)][object[]]$Screens,
+        [string]$AssignedMonitor,
+        [string]$AssignedMonitorCode
+    )
+
+    $monitorCode = [string]$AssignedMonitorCode
+    if (-not [string]::IsNullOrWhiteSpace($monitorCode)) {
+        $matchByCode = $Screens | Where-Object { [string]$_.MonitorCode -eq $monitorCode } | Select-Object -First 1
+        if ($matchByCode) { return $matchByCode }
+    }
+
+    $monitorName = [string]$AssignedMonitor
+    if (-not [string]::IsNullOrWhiteSpace($monitorName)) {
+        $matchByName = $Screens | Where-Object { [string]$_.DeviceName -eq $monitorName } | Select-Object -First 1
+        if ($matchByName) { return $matchByName }
+
+        $normalized = ($monitorName -replace '^\\\\\.\\', '')
+        if (-not [string]::IsNullOrWhiteSpace($normalized)) {
+            $matchBySlot = $Screens | Where-Object { [string]$_.DisplaySlot -eq $normalized } | Select-Object -First 1
+            if ($matchBySlot) { return $matchBySlot }
+        }
+    }
+
+    return $null
 }
 
 function Split-CommandLineExecutableAndArguments {
@@ -845,6 +910,54 @@ function Get-Profile {
     return $Config.Profiles | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
 }
 
+function Test-TitleMatch {
+    param(
+        [string]$RuleTitle,
+        [string]$WindowTitle
+    )
+
+    $rule = [string]$RuleTitle
+    $window = [string]$WindowTitle
+
+    if ([string]::IsNullOrWhiteSpace($rule)) {
+        return $true
+    }
+    if ([string]::IsNullOrWhiteSpace($window)) {
+        return $false
+    }
+
+    if ([string]::Equals($rule, $window, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    # VS Code wechselt den Fenstertitel dynamisch (Datei/Workspace), daher als Fallback Teilvergleich.
+    if ($window.IndexOf($rule, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+    if ($rule.IndexOf($window, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+
+    $ruleNormalized = ($rule -replace '\s+-\s+Visual Studio Code$', '').Trim()
+    $windowNormalized = ($window -replace '\s+-\s+Visual Studio Code$', '').Trim()
+    if (
+        -not [string]::IsNullOrWhiteSpace($ruleNormalized) -and
+        -not [string]::IsNullOrWhiteSpace($windowNormalized)
+    ) {
+        if ([string]::Equals($ruleNormalized, $windowNormalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+        if ($windowNormalized.IndexOf($ruleNormalized, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+        if ($ruleNormalized.IndexOf($windowNormalized, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Capture-Layout {
     param(
         [Parameter(Mandatory)]$Config,
@@ -860,6 +973,10 @@ function Capture-Layout {
 
     $layout = @()
     foreach ($w in $windows) {
+        if (Test-IsToolWindowRule -ProcessName ([string]$w.ProcessName) -ExecutablePath ([string](Get-SafePropertyValue -Object $w -Name 'ExecutablePath' -DefaultValue '')) -LaunchArguments ([string](Get-SafePropertyValue -Object $w -Name 'LaunchArguments' -DefaultValue '')) -Title ([string]$w.Title)) {
+            continue
+        }
+
         $screenForWindow = Resolve-ScreenByRect -Left ([int]$w.Left) -Top ([int]$w.Top) -Width ([int]$w.Width) -Height ([int]$w.Height)
         $relativeRect = $null
         if ($screenForWindow) {
@@ -876,6 +993,7 @@ function Capture-Layout {
             Width = $w.Width
             Height = $w.Height
             AssignedMonitor = if ($screenForWindow) { [string]$screenForWindow.DeviceName } else { '' }
+            AssignedMonitorCode = if ($screenForWindow) { [string]$screenForWindow.MonitorCode } else { '' }
             ZonePreset = 'Custom'
             RelativeLeft = if ($relativeRect) { [double]$relativeRect.RelativeLeft } else { -1.0 }
             RelativeTop = if ($relativeRect) { [double]$relativeRect.RelativeTop } else { -1.0 }
@@ -903,18 +1021,67 @@ function Close-ProfileWindows {
     $closed = 0
     $WM_CLOSE = 0x0010
 
+    $selfProcessId = $PID
+    $selfWindowHandle = 0L
+    $selfWindowTitle = ''
+    $scriptLeaf = ''
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        try {
+            $scriptLeaf = [System.IO.Path]::GetFileName($PSCommandPath)
+        }
+        catch {
+            $scriptLeaf = ''
+        }
+    }
+    try {
+        if ($null -ne $window) {
+            $selfWindowHandle = [int64]([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle
+            $selfWindowTitle = [string]$window.Title
+        }
+    }
+    catch {
+    }
+    Write-DebugLog -Config $Config -Scope 'Close' -Message "Self: PID=$selfProcessId Handle=$selfWindowHandle Titel='$selfWindowTitle'"
+
+    $screens = @(Get-Screens)
+
     foreach ($rule in $profile.WindowLayouts) {
+        $ruleProcessName = [string](Get-SafePropertyValue -Object $rule -Name 'ProcessName' -DefaultValue '')
         $ruleExecutablePath = [string](Get-SafePropertyValue -Object $rule -Name 'ExecutablePath' -DefaultValue '')
+        $ruleLaunchArguments = [string](Get-SafePropertyValue -Object $rule -Name 'LaunchArguments' -DefaultValue '')
         $ruleTitle = [string](Get-SafePropertyValue -Object $rule -Name 'Title' -DefaultValue '')
 
-        if ([string]::IsNullOrWhiteSpace($ruleExecutablePath)) {
+        if (Test-IsToolWindowRule -ProcessName $ruleProcessName -ExecutablePath $ruleExecutablePath -LaunchArguments $ruleLaunchArguments -Title $ruleTitle) {
+            Write-DebugLog -Config $Config -Scope 'Close' -Message "Regel uebersprungen (Tool-Fenster-Schutz): Prozess='$ruleProcessName' Titel='$ruleTitle'"
             continue
         }
 
-        $matchingWindows = @($current | Where-Object {
-            ([string]::Equals([string](Get-SafePropertyValue -Object $_ -Name 'ExecutablePath' -DefaultValue ''), $ruleExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)) -and
-            ([string]::Equals([string](Get-SafePropertyValue -Object $_ -Name 'Title' -DefaultValue ''), $ruleTitle, [System.StringComparison]::OrdinalIgnoreCase))
-        })
+        if ([string]::IsNullOrWhiteSpace($ruleExecutablePath) -and [string]::IsNullOrWhiteSpace($ruleProcessName)) {
+            continue
+        }
+
+        $matchingWindows = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidateWindow in $current) {
+            $currentPid    = [int](Get-SafePropertyValue -Object $candidateWindow -Name 'ProcessId'      -DefaultValue 0)
+            $currentHandle = [int64](Get-SafePropertyValue -Object $candidateWindow -Name 'Handle'       -DefaultValue 0)
+            $currentExe    = [string](Get-SafePropertyValue -Object $candidateWindow -Name 'ExecutablePath' -DefaultValue '')
+            $currentProcessName = [string](Get-SafePropertyValue -Object $candidateWindow -Name 'ProcessName' -DefaultValue '')
+            $currentTitle  = [string](Get-SafePropertyValue -Object $candidateWindow -Name 'Title'       -DefaultValue '')
+
+            $pathMatches = (-not [string]::IsNullOrWhiteSpace($ruleExecutablePath)) -and
+                           [string]::Equals($currentExe, $ruleExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)
+            $processMatches = (-not [string]::IsNullOrWhiteSpace($ruleProcessName)) -and
+                              [string]::Equals($currentProcessName, $ruleProcessName, [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not ($pathMatches -or $processMatches)) { continue }
+            if (-not (Test-TitleMatch -RuleTitle $ruleTitle -WindowTitle $currentTitle)) { continue }
+
+            if (Test-IsToolWindowInstance -WindowItem $candidateWindow -SelfProcessId $selfProcessId -SelfWindowHandle $selfWindowHandle -SelfWindowTitle $selfWindowTitle -ScriptLeaf $scriptLeaf) {
+                Write-DebugLog -Config $Config -Scope 'Close' -Message "SKIP (Tool-Fenster): '$currentTitle' (PID: $currentPid Handle: $currentHandle)"
+                continue
+            }
+
+            $matchingWindows.Add($candidateWindow)
+        }
 
         foreach ($w in $matchingWindows) {
             try {
@@ -937,6 +1104,134 @@ function Close-ProfileWindows {
     }
 }
 
+function Close-AllVisibleWindows {
+    param([Parameter(Mandatory)]$Config)
+
+    $current = Get-VisibleTopLevelWindows -ExcludedProcesses $Config.Settings.ExcludedProcesses
+    $closed = 0
+    $WM_CLOSE = 0x0010
+    $selfProcessId = $PID
+    $selfWindowHandle = 0L
+    $selfWindowTitle = ''
+    $scriptLeaf = ''
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        try {
+            $scriptLeaf = [System.IO.Path]::GetFileName($PSCommandPath)
+        }
+        catch {
+            $scriptLeaf = ''
+        }
+    }
+    try {
+        if ($null -ne $window) {
+            $selfWindowHandle = [int64]([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle
+            $selfWindowTitle = [string]$window.Title
+        }
+    }
+    catch {
+    }
+    Write-DebugLog -Config $Config -Scope 'CloseAll' -Message "Self: PID=$selfProcessId Handle=$selfWindowHandle Titel='$selfWindowTitle'"
+
+    foreach ($windowItem in $current) {
+        $windowProcessId = [int](Get-SafePropertyValue -Object $windowItem -Name 'ProcessId' -DefaultValue 0)
+        $windowHandle    = [int64](Get-SafePropertyValue -Object $windowItem -Name 'Handle'    -DefaultValue 0)
+        $windowTitle     = [string](Get-SafePropertyValue -Object $windowItem -Name 'Title'     -DefaultValue '')
+
+        if (Test-IsToolWindowInstance -WindowItem $windowItem -SelfProcessId $selfProcessId -SelfWindowHandle $selfWindowHandle -SelfWindowTitle $selfWindowTitle -ScriptLeaf $scriptLeaf) {
+            Write-DebugLog -Config $Config -Scope 'CloseAll' -Message "SKIP (Tool-Fenster): '$windowTitle' (PID: $windowProcessId Handle: $windowHandle)"
+            continue
+        }
+
+        try {
+            $hWnd = [IntPtr]$windowItem.Handle
+            $result = [MultiMonitorWinApi]::PostMessage($hWnd, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+            if ($result) {
+                $closed++
+                Write-DebugLog -Config $Config -Scope 'CloseAll' -Message "Fenster geschlossen: $($windowItem.Title) (PID: $($windowItem.ProcessId))"
+            }
+        }
+        catch {
+            Write-DebugLog -Config $Config -Scope 'CloseAll' -Message "Fehler beim Schließen von $($windowItem.Title): $_"
+        }
+    }
+
+    if ($closed -gt 0) {
+        Start-Sleep -Milliseconds 300
+    }
+
+    return $closed
+}
+
+function Prepare-ProfileStart {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string]$PreviousProfileName = $null
+    )
+
+    $promptEnabled = [bool](Get-SafePropertyValue -Object $Config.Settings -Name 'PromptBeforeCloseAllWindows' -DefaultValue $true)
+    if (-not $promptEnabled) {
+        if ($PreviousProfileName -and $PreviousProfileName -ne $ProfileName) {
+            $prevProfile = Get-Profile -Config $Config -Name $PreviousProfileName
+            if ($prevProfile) {
+                Close-ProfileWindows -Config $Config -ProfileName $PreviousProfileName
+            }
+        }
+        else {
+            $currentProfile = Get-ActiveProfileName -Config $Config
+            if ($currentProfile -and $currentProfile -ne $ProfileName) {
+                Close-ProfileWindows -Config $Config -ProfileName $currentProfile
+            }
+        }
+        Close-ProfileWindows -Config $Config -ProfileName $ProfileName
+        return $true
+    }
+
+    $message = @(
+        "Sollen vor dem Start des Profils '$ProfileName' alle aktuell geöffneten Fenster geschlossen werden?",
+        '',
+        'Ja = alle offenen Fenster schließen.',
+        'Nein = nur bekannte Fenster des bisherigen/neuen Profils schließen.',
+        'Abbrechen = Profilstart abbrechen.'
+    ) -join "`r`n"
+
+    $decision = [System.Windows.MessageBox]::Show(
+        $message,
+        'Profilstart',
+        [System.Windows.MessageBoxButton]::YesNoCancel,
+        [System.Windows.MessageBoxImage]::Question
+    )
+
+    if ($decision -eq [System.Windows.MessageBoxResult]::Cancel) {
+        Write-Log "Profilstart fuer $ProfileName abgebrochen."
+        return $false
+    }
+
+    if ($decision -eq [System.Windows.MessageBoxResult]::Yes) {
+        $closedAll = Close-AllVisibleWindows -Config $Config
+        Write-Log "Vor Profilstart wurden $closedAll offene Fenster geschlossen."
+        return $true
+    }
+
+    if ($PreviousProfileName -and $PreviousProfileName -ne $ProfileName) {
+        $prevProfile = Get-Profile -Config $Config -Name $PreviousProfileName
+        if ($prevProfile) {
+            Close-ProfileWindows -Config $Config -ProfileName $PreviousProfileName
+            Write-DebugLog -Config $Config -Scope 'PrepareProfile' -Message "Fenster des bisherigen Profils '$PreviousProfileName' geschlossen"
+        }
+    }
+    else {
+        $currentProfile = Get-ActiveProfileName -Config $Config
+        if ($currentProfile -and $currentProfile -ne $ProfileName) {
+            Close-ProfileWindows -Config $Config -ProfileName $currentProfile
+            Write-DebugLog -Config $Config -Scope 'PrepareProfile' -Message "Fenster des aktuellen Profils '$currentProfile' geschlossen"
+        }
+    }
+
+    Close-ProfileWindows -Config $Config -ProfileName $ProfileName
+    return $true
+}
+
 function Restore-Layout {
     param(
         [Parameter(Mandatory)]$Config,
@@ -955,6 +1250,7 @@ function Restore-Layout {
     }
 
     $current = Get-VisibleTopLevelWindows -ExcludedProcesses $Config.Settings.ExcludedProcesses
+    $screens = @(Get-Screens)
     $moved = 0
     $missing = 0
     $invalid = 0
@@ -969,25 +1265,35 @@ function Restore-Layout {
         $ruleExecutablePath = [string](Get-SafePropertyValue -Object $rule -Name 'ExecutablePath' -DefaultValue '')
         $ruleLaunchArguments = [string](Get-SafePropertyValue -Object $rule -Name 'LaunchArguments' -DefaultValue '')
         $ruleTitle = [string](Get-SafePropertyValue -Object $rule -Name 'Title' -DefaultValue '')
+        if (Test-IsToolWindowRule -ProcessName $ruleProcessName -ExecutablePath $ruleExecutablePath -LaunchArguments $ruleLaunchArguments -Title $ruleTitle) {
+            continue
+        }
         $ruleLeft = [int](Get-SafePropertyValue -Object $rule -Name 'Left' -DefaultValue 0)
         $ruleTop = [int](Get-SafePropertyValue -Object $rule -Name 'Top' -DefaultValue 0)
         $ruleWidth = [int](Get-SafePropertyValue -Object $rule -Name 'Width' -DefaultValue 800)
         $ruleHeight = [int](Get-SafePropertyValue -Object $rule -Name 'Height' -DefaultValue 600)
         $ruleAssignedMonitor = [string](Get-SafePropertyValue -Object $rule -Name 'AssignedMonitor' -DefaultValue '')
+        $ruleAssignedMonitorCode = [string](Get-SafePropertyValue -Object $rule -Name 'AssignedMonitorCode' -DefaultValue '')
         $ruleZonePreset = [string](Get-SafePropertyValue -Object $rule -Name 'ZonePreset' -DefaultValue 'Custom')
         $ruleRelativeLeft = [double](Get-SafePropertyValue -Object $rule -Name 'RelativeLeft' -DefaultValue -1.0)
         $ruleRelativeTop = [double](Get-SafePropertyValue -Object $rule -Name 'RelativeTop' -DefaultValue -1.0)
         $ruleRelativeWidth = [double](Get-SafePropertyValue -Object $rule -Name 'RelativeWidth' -DefaultValue -1.0)
         $ruleRelativeHeight = [double](Get-SafePropertyValue -Object $rule -Name 'RelativeHeight' -DefaultValue -1.0)
 
+        $resolvedScreen = Resolve-ScreenByIdentity -Screens $screens -AssignedMonitor $ruleAssignedMonitor -AssignedMonitorCode $ruleAssignedMonitorCode
+        if ($resolvedScreen) {
+            $rule.AssignedMonitor = [string]$resolvedScreen.DeviceName
+            $rule.AssignedMonitorCode = [string]$resolvedScreen.MonitorCode
+        }
+
         $zoneRect = $null
         $zoneScreen = $null
         if (
-            -not [string]::IsNullOrWhiteSpace($ruleAssignedMonitor) -and
+            $resolvedScreen -and
             -not [string]::IsNullOrWhiteSpace($ruleZonePreset) -and
             $ruleZonePreset -ne 'Custom'
         ) {
-            $zoneScreen = Get-Screens | Where-Object { $_.DeviceName -eq $ruleAssignedMonitor } | Select-Object -First 1
+            $zoneScreen = $resolvedScreen
             if ($zoneScreen) {
                 $zoneRect = Get-ZoneRect -ScreenBounds $zoneScreen -Zone $ruleZonePreset
             }
@@ -1004,13 +1310,13 @@ function Restore-Layout {
             $targetHeight = [int]$zoneRect.Height
         }
         elseif (
-            -not [string]::IsNullOrWhiteSpace($ruleAssignedMonitor) -and
+            $resolvedScreen -and
             $ruleRelativeLeft -ge 0 -and
             $ruleRelativeTop -ge 0 -and
             $ruleRelativeWidth -gt 0 -and
             $ruleRelativeHeight -gt 0
         ) {
-            $relativeScreen = if ($zoneScreen) { $zoneScreen } else { Get-Screens | Where-Object { $_.DeviceName -eq $ruleAssignedMonitor } | Select-Object -First 1 }
+            $relativeScreen = if ($zoneScreen) { $zoneScreen } else { $resolvedScreen }
             if ($relativeScreen) {
                 $relativeRect = Get-AbsoluteRectFromRelative -ScreenItem $relativeScreen -RelativeLeft $ruleRelativeLeft -RelativeTop $ruleRelativeTop -RelativeWidth $ruleRelativeWidth -RelativeHeight $ruleRelativeHeight
                 if ($relativeRect) {
@@ -1018,6 +1324,31 @@ function Restore-Layout {
                     $targetTop = [int]$relativeRect.Top
                     $targetWidth = [int]$relativeRect.Width
                     $targetHeight = [int]$relativeRect.Height
+                }
+            }
+        }
+        elseif ($resolvedScreen) {
+            $legacySourceScreen = Resolve-ScreenByRect -Left $ruleLeft -Top $ruleTop -Width $ruleWidth -Height $ruleHeight
+            if ($legacySourceScreen) {
+                $legacyRelative = Get-RelativeRectOnScreen -ScreenItem $legacySourceScreen -Left $ruleLeft -Top $ruleTop -Width $ruleWidth -Height $ruleHeight
+                if (
+                    $legacyRelative -and
+                    $legacyRelative.RelativeWidth -gt 0 -and
+                    $legacyRelative.RelativeHeight -gt 0 -and
+                    $legacyRelative.RelativeWidth -le 1.5 -and
+                    $legacyRelative.RelativeHeight -le 1.5 -and
+                    $legacyRelative.RelativeLeft -ge -0.5 -and
+                    $legacyRelative.RelativeLeft -le 1.5 -and
+                    $legacyRelative.RelativeTop -ge -0.5 -and
+                    $legacyRelative.RelativeTop -le 1.5
+                ) {
+                    $legacyTargetRect = Get-AbsoluteRectFromRelative -ScreenItem $resolvedScreen -RelativeLeft ([double]$legacyRelative.RelativeLeft) -RelativeTop ([double]$legacyRelative.RelativeTop) -RelativeWidth ([double]$legacyRelative.RelativeWidth) -RelativeHeight ([double]$legacyRelative.RelativeHeight)
+                    if ($legacyTargetRect) {
+                        $targetLeft = [int]$legacyTargetRect.Left
+                        $targetTop = [int]$legacyTargetRect.Top
+                        $targetWidth = [int]$legacyTargetRect.Width
+                        $targetHeight = [int]$legacyTargetRect.Height
+                    }
                 }
             }
         }
@@ -1059,13 +1390,16 @@ function Restore-Layout {
                             if (-not [string]::IsNullOrWhiteSpace($workspacePath)) {
                                 $launchArgumentsToUse = "--new-window `"$workspacePath`""
                             }
+                            else {
+                                $launchArgumentsToUse = '--new-window'
+                            }
                         }
                         elseif ($launchArgumentsToUse -notmatch '(?i)--new-window|--reuse-window') {
                             $launchArgumentsToUse = "--new-window $launchArgumentsToUse"
                         }
                     }
 
-                    $startParams = @{ FilePath = $ruleExecutablePath }
+                    $startParams = @{ FilePath = $ruleExecutablePath; WindowStyle = 'Normal' }
                     if (-not [string]::IsNullOrWhiteSpace($workingDir) -and (Test-Path -LiteralPath $workingDir)) {
                         $startParams.WorkingDirectory = $workingDir
                     }
@@ -1130,7 +1464,43 @@ function Restore-Layout {
             $runId, [int64]$target.Handle, $ruleProcessName, $ruleTitle, $ruleAssignedMonitor, $ruleZonePreset, $ruleLeft, $ruleTop, $ruleWidth, $ruleHeight, $targetLeft, $targetTop, $targetWidth, $targetHeight, $ruleRelativeLeft, $ruleRelativeTop, $ruleRelativeWidth, $ruleRelativeHeight, $zoneRectText, $beforeText
         )
 
-        $ok = [MultiMonitorWinApi]::MoveWindow([IntPtr]::new([int64]$target.Handle), $targetLeft, $targetTop, $targetWidth, $targetHeight, $true)
+        $hWnd = [IntPtr]::new([int64]$target.Handle)
+
+        # Minimiertes Fenster zuerst wiederherstellen, damit MoveWindow sofort auf
+        # Position und Größe wirkt (IsIconic = minimiert → WM_SYSCOMMAND SC_RESTORE).
+        if ([MultiMonitorWinApi]::IsIconic($hWnd)) {
+            [void][MultiMonitorWinApi]::PostMessage($hWnd, 0x0112, [IntPtr]::new(0xF120), [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 120
+        }
+
+        # Zweistufiges MoveWindow bei Monitor-übergreifendem Verschieben:
+        # Schritt 1 platziert das Fenster auf dem Zielmonitor → Windows aktualisiert
+        # den DPI-Kontext des Fensters; DPI-aware Apps reagieren auf WM_DPICHANGED
+        # und ändern ihre Größe selbst. Schritt 2 setzt die endgültige korrekte
+        # Position/Größe und überschreibt die DPI-Reaktion des Fensters.
+        $crossMonitor = $false
+        if ($resolvedScreen) {
+            if ($null -eq $beforeRect) {
+                $crossMonitor = $true
+            }
+            else {
+                $srcCX = [double]$beforeRect.Left + ([double]$beforeRect.Width  / 2.0)
+                $srcCY = [double]$beforeRect.Top  + ([double]$beforeRect.Height / 2.0)
+                $crossMonitor = (
+                    $srcCX -lt  [double]$resolvedScreen.BoundsX -or
+                    $srcCX -ge ([double]$resolvedScreen.BoundsX + [double]$resolvedScreen.BoundsWidth) -or
+                    $srcCY -lt  [double]$resolvedScreen.BoundsY -or
+                    $srcCY -ge ([double]$resolvedScreen.BoundsY + [double]$resolvedScreen.BoundsHeight)
+                )
+            }
+        }
+
+        if ($crossMonitor) {
+            [void][MultiMonitorWinApi]::MoveWindow($hWnd, $targetLeft, $targetTop, $targetWidth, $targetHeight, $false)
+            Start-Sleep -Milliseconds 80
+        }
+
+        $ok = [MultiMonitorWinApi]::MoveWindow($hWnd, $targetLeft, $targetTop, $targetWidth, $targetHeight, $true)
         $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         $afterRect = Get-WindowRectSnapshot -Handle ([int64]$target.Handle)
         $afterText = if ($afterRect) {
@@ -1172,15 +1542,17 @@ function Update-ProfileExecutablePathsFromCurrentWindows {
         foreach ($rule in @($profile.WindowLayouts)) {
             $ruleExecutablePath = [string](Get-SafePropertyValue -Object $rule -Name 'ExecutablePath' -DefaultValue '')
             $ruleLaunchArguments = [string](Get-SafePropertyValue -Object $rule -Name 'LaunchArguments' -DefaultValue '')
+            $ruleProcessName = [string](Get-SafePropertyValue -Object $rule -Name 'ProcessName' -DefaultValue '')
+            $ruleTitle = [string](Get-SafePropertyValue -Object $rule -Name 'Title' -DefaultValue '')
+            if (Test-IsToolWindowRule -ProcessName $ruleProcessName -ExecutablePath $ruleExecutablePath -LaunchArguments $ruleLaunchArguments -Title $ruleTitle) {
+                continue
+            }
             if (
                 -not [string]::IsNullOrWhiteSpace($ruleExecutablePath) -and
                 -not [string]::IsNullOrWhiteSpace($ruleLaunchArguments)
             ) {
                 continue
             }
-
-            $ruleProcessName = [string](Get-SafePropertyValue -Object $rule -Name 'ProcessName' -DefaultValue '')
-            $ruleTitle = [string](Get-SafePropertyValue -Object $rule -Name 'Title' -DefaultValue '')
             if ([string]::IsNullOrWhiteSpace($ruleProcessName)) {
                 continue
             }
@@ -1229,6 +1601,7 @@ function Update-ProfileExecutablePathsFromCurrentWindows {
 }
 
 function Rescue-WindowsToPrimary {
+    param($Config = $null)
     $screens = [System.Windows.Forms.Screen]::AllScreens
     $primary = $screens | Where-Object { $_.Primary } | Select-Object -First 1
     if (-not $primary) { return 0 }
@@ -1238,7 +1611,12 @@ function Rescue-WindowsToPrimary {
     $right = ($screens | ForEach-Object { $_.Bounds.Right } | Measure-Object -Maximum).Maximum
     $bottom = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum
 
-    $windows = Get-VisibleTopLevelWindows -ExcludedProcesses @('dwm','explorer','ShellExperienceHost','StartMenuExperienceHost','ApplicationFrameHost')
+    $excludedProcs = if ($null -ne $Config -and $null -ne $Config.Settings -and $null -ne $Config.Settings.ExcludedProcesses) {
+        @($Config.Settings.ExcludedProcesses)
+    } else {
+        @('dwm','explorer','ShellExperienceHost','StartMenuExperienceHost','ApplicationFrameHost')
+    }
+    $windows = Get-VisibleTopLevelWindows -ExcludedProcesses $excludedProcs
     $moved = 0
 
     foreach ($w in $windows) {
@@ -1314,6 +1692,106 @@ function Get-SafePropertyValue {
     return $DefaultValue
 }
 
+function Test-IsToolWindowRule {
+    param(
+        [string]$ProcessName,
+        [string]$ExecutablePath,
+        [string]$LaunchArguments,
+        [string]$Title
+    )
+
+    $ruleTitle = [string]$Title
+    if ([string]::Equals($ruleTitle, 'Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $scriptLeaf = ''
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        try {
+            $scriptLeaf = [System.IO.Path]::GetFileName($PSCommandPath)
+        }
+        catch {
+            $scriptLeaf = ''
+        }
+    }
+
+    $ruleLaunchArguments = [string]$LaunchArguments
+    if (
+        -not [string]::IsNullOrWhiteSpace($scriptLeaf) -and
+        -not [string]::IsNullOrWhiteSpace($ruleLaunchArguments) -and
+        $ruleLaunchArguments.IndexOf($scriptLeaf, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    ) {
+        return $true
+    }
+
+    $ruleProcessName = [string]$ProcessName
+    $exeName = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$ExecutablePath)) {
+        try {
+            $exeName = [System.IO.Path]::GetFileNameWithoutExtension([string]$ExecutablePath)
+        }
+        catch {
+            $exeName = ''
+        }
+    }
+
+    if (
+        ($ruleProcessName -ieq 'powershell' -or $ruleProcessName -ieq 'pwsh' -or $exeName -ieq 'powershell' -or $exeName -ieq 'pwsh') -and
+        [string]::Equals($ruleTitle, 'Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        return $true
+    }
+
+    return $false
+}
+
+function Test-IsToolWindowInstance {
+    param(
+        [Parameter(Mandatory)]$WindowItem,
+        [int]$SelfProcessId = 0,
+        [int64]$SelfWindowHandle = 0,
+        [string]$SelfWindowTitle = '',
+        [string]$ScriptLeaf = ''
+    )
+
+    $windowPid = [int](Get-SafePropertyValue -Object $WindowItem -Name 'ProcessId' -DefaultValue 0)
+    $windowHandle = [int64](Get-SafePropertyValue -Object $WindowItem -Name 'Handle' -DefaultValue 0)
+    $windowTitle = [string](Get-SafePropertyValue -Object $WindowItem -Name 'Title' -DefaultValue '')
+    $windowProcessName = [string](Get-SafePropertyValue -Object $WindowItem -Name 'ProcessName' -DefaultValue '')
+    $windowExecutablePath = [string](Get-SafePropertyValue -Object $WindowItem -Name 'ExecutablePath' -DefaultValue '')
+    $windowLaunchArguments = [string](Get-SafePropertyValue -Object $WindowItem -Name 'LaunchArguments' -DefaultValue '')
+
+    if ($windowPid -eq [int]$SelfProcessId) {
+        return $true
+    }
+
+    if ($SelfWindowHandle -ne 0 -and $windowHandle -eq $SelfWindowHandle) {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SelfWindowTitle) -and [string]::Equals($windowTitle, $SelfWindowTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($windowTitle) -and $windowTitle.IndexOf('Multi-Monitor Profile Tool', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($ScriptLeaf) -and
+        -not [string]::IsNullOrWhiteSpace($windowLaunchArguments) -and
+        $windowLaunchArguments.IndexOf($ScriptLeaf, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    ) {
+        return $true
+    }
+
+    if (Test-IsToolWindowRule -ProcessName $windowProcessName -ExecutablePath $windowExecutablePath -LaunchArguments $windowLaunchArguments -Title $windowTitle) {
+        return $true
+    }
+
+    return $false
+}
+
 function Ensure-ConfigSchema {
     param([Parameter(Mandatory)]$Config)
 
@@ -1336,22 +1814,46 @@ function Ensure-ConfigSchema {
         $Config | Add-Member -NotePropertyName ActiveProfile -NotePropertyValue ($Config.Profiles[0].Name) -Force
     }
 
+    $availableScreens = @(Get-Screens)
+
     foreach ($p in $Config.Profiles) {
         if (-not $p.WindowLayouts) { $p.WindowLayouts = @() }
         if (-not $p.DisplayMode) { $p.DisplayMode = 'extend' }
 
         $normalizedLayouts = @()
         foreach ($layout in $p.WindowLayouts) {
+            $layoutLeft = [int](Get-SafePropertyValue -Object $layout -Name 'Left' -DefaultValue 0)
+            $layoutTop = [int](Get-SafePropertyValue -Object $layout -Name 'Top' -DefaultValue 0)
+            $layoutWidth = [int](Get-SafePropertyValue -Object $layout -Name 'Width' -DefaultValue 800)
+            $layoutHeight = [int](Get-SafePropertyValue -Object $layout -Name 'Height' -DefaultValue 600)
+
+            $layoutAssignedMonitor = [string](Get-SafePropertyValue -Object $layout -Name 'AssignedMonitor' -DefaultValue '')
+            $layoutAssignedMonitorCode = [string](Get-SafePropertyValue -Object $layout -Name 'AssignedMonitorCode' -DefaultValue '')
+
+            $resolvedScreenForLayout = Resolve-ScreenByIdentity -Screens $availableScreens -AssignedMonitor $layoutAssignedMonitor -AssignedMonitorCode $layoutAssignedMonitorCode
+            if (-not $resolvedScreenForLayout -and $layoutWidth -gt 0 -and $layoutHeight -gt 0) {
+                $resolvedScreenForLayout = Resolve-ScreenByRect -Left $layoutLeft -Top $layoutTop -Width $layoutWidth -Height $layoutHeight
+            }
+            if ($resolvedScreenForLayout) {
+                if ([string]::IsNullOrWhiteSpace($layoutAssignedMonitor)) {
+                    $layoutAssignedMonitor = [string]$resolvedScreenForLayout.DeviceName
+                }
+                if ([string]::IsNullOrWhiteSpace($layoutAssignedMonitorCode)) {
+                    $layoutAssignedMonitorCode = [string]$resolvedScreenForLayout.MonitorCode
+                }
+            }
+
             $normalizedLayouts += [pscustomobject]@{
                 ProcessName = [string](Get-SafePropertyValue -Object $layout -Name 'ProcessName' -DefaultValue '')
                 ExecutablePath = [string](Get-SafePropertyValue -Object $layout -Name 'ExecutablePath' -DefaultValue '')
                 LaunchArguments = [string](Get-SafePropertyValue -Object $layout -Name 'LaunchArguments' -DefaultValue '')
                 Title = [string](Get-SafePropertyValue -Object $layout -Name 'Title' -DefaultValue '')
-                Left = [int](Get-SafePropertyValue -Object $layout -Name 'Left' -DefaultValue 0)
-                Top = [int](Get-SafePropertyValue -Object $layout -Name 'Top' -DefaultValue 0)
-                Width = [int](Get-SafePropertyValue -Object $layout -Name 'Width' -DefaultValue 800)
-                Height = [int](Get-SafePropertyValue -Object $layout -Name 'Height' -DefaultValue 600)
-                AssignedMonitor = [string](Get-SafePropertyValue -Object $layout -Name 'AssignedMonitor' -DefaultValue '')
+                Left = $layoutLeft
+                Top = $layoutTop
+                Width = $layoutWidth
+                Height = $layoutHeight
+                AssignedMonitor = $layoutAssignedMonitor
+                AssignedMonitorCode = $layoutAssignedMonitorCode
                 ZonePreset = [string](Get-SafePropertyValue -Object $layout -Name 'ZonePreset' -DefaultValue 'Custom')
                 RelativeLeft = [double](Get-SafePropertyValue -Object $layout -Name 'RelativeLeft' -DefaultValue -1.0)
                 RelativeTop = [double](Get-SafePropertyValue -Object $layout -Name 'RelativeTop' -DefaultValue -1.0)
@@ -1359,7 +1861,11 @@ function Ensure-ConfigSchema {
                 RelativeHeight = [double](Get-SafePropertyValue -Object $layout -Name 'RelativeHeight' -DefaultValue -1.0)
             }
         }
-        $p.WindowLayouts = $normalizedLayouts
+        $p.WindowLayouts = @(
+            $normalizedLayouts | Where-Object {
+                -not (Test-IsToolWindowRule -ProcessName ([string](Get-SafePropertyValue -Object $_ -Name 'ProcessName' -DefaultValue '')) -ExecutablePath ([string](Get-SafePropertyValue -Object $_ -Name 'ExecutablePath' -DefaultValue '')) -LaunchArguments ([string](Get-SafePropertyValue -Object $_ -Name 'LaunchArguments' -DefaultValue '')) -Title ([string](Get-SafePropertyValue -Object $_ -Name 'Title' -DefaultValue '')))
+            }
+        )
     }
 
     if (-not $Config.Settings.PSObject.Properties.Name.Contains('RestoreAfterSwitch')) {
@@ -1394,6 +1900,12 @@ function Ensure-ConfigSchema {
     }
     if (-not $Config.Settings.PSObject.Properties.Name.Contains('RunAtStartup')) {
         $Config.Settings | Add-Member -NotePropertyName RunAtStartup -NotePropertyValue $false -Force
+    }
+    if (-not $Config.Settings.PSObject.Properties.Name.Contains('StartMinimizedWithWindows')) {
+        $Config.Settings | Add-Member -NotePropertyName StartMinimizedWithWindows -NotePropertyValue $false -Force
+    }
+    if (-not $Config.Settings.PSObject.Properties.Name.Contains('PromptBeforeCloseAllWindows')) {
+        $Config.Settings | Add-Member -NotePropertyName PromptBeforeCloseAllWindows -NotePropertyValue $true -Force
     }
 
     return $Config
@@ -1461,6 +1973,63 @@ function Get-CanvasZoneAtPosition {
         Zone = $zone
         MonitorMap = $targetMap
     }
+}
+
+function Clear-LiveZoneOverlay {
+    if ($null -eq $script:liveZoneOverlay) { return }
+    if ($controls.ContainsKey('CanvasLayout') -and $null -ne $controls.CanvasLayout -and $controls.CanvasLayout.Children.Contains($script:liveZoneOverlay)) {
+        $controls.CanvasLayout.Children.Remove($script:liveZoneOverlay)
+    }
+    $script:liveZoneOverlay = $null
+}
+
+function Show-LiveZoneOverlay {
+    param(
+        [Parameter(Mandatory)]$ZoneInfo,
+        [string]$LabelText = ''
+    )
+
+    if ($null -eq $ZoneInfo -or $null -eq $ZoneInfo.MonitorMap) {
+        Clear-LiveZoneOverlay
+        return
+    }
+
+    $zoneRect = Get-CanvasZoneRect -MonitorMap $ZoneInfo.MonitorMap -Zone ([string]$ZoneInfo.Zone)
+    if ($null -eq $zoneRect) {
+        Clear-LiveZoneOverlay
+        return
+    }
+
+    if ($null -eq $script:liveZoneOverlay) {
+        $overlay = New-Object System.Windows.Controls.Border
+        $overlay.CornerRadius = New-Object System.Windows.CornerRadius(10)
+        $overlay.BorderThickness = New-Object System.Windows.Thickness(3)
+        $overlay.BorderBrush = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(34,197,94))
+        $overlay.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(110,34,197,94))
+        $overlay.IsHitTestVisible = $false
+
+        $text = New-Object System.Windows.Controls.TextBlock
+        $text.HorizontalAlignment = 'Center'
+        $text.VerticalAlignment = 'Center'
+        $text.TextAlignment = 'Center'
+        $text.FontSize = 14
+        $text.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $text.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(240,253,244))
+        $overlay.Child = $text
+
+        $script:liveZoneOverlay = $overlay
+        $controls.CanvasLayout.Children.Add($script:liveZoneOverlay) | Out-Null
+    }
+
+    $script:liveZoneOverlay.Width = [double]$zoneRect.W
+    $script:liveZoneOverlay.Height = [double]$zoneRect.H
+    if ($script:liveZoneOverlay.Child -is [System.Windows.Controls.TextBlock]) {
+        $script:liveZoneOverlay.Child.Text = $LabelText
+    }
+
+    [System.Windows.Controls.Canvas]::SetLeft($script:liveZoneOverlay, [double]$zoneRect.X)
+    [System.Windows.Controls.Canvas]::SetTop($script:liveZoneOverlay, [double]$zoneRect.Y)
+    [System.Windows.Controls.Canvas]::SetZIndex($script:liveZoneOverlay, 25)
 }
 
 function Render-ZonePreview {
@@ -1552,6 +2121,7 @@ function Set-WindowRuleForProfile {
         $existing.Width = [int]$targetRect.Width
         $existing.Height = [int]$targetRect.Height
         $existing.AssignedMonitor = [string]$ScreenItem.DeviceName
+        $existing.AssignedMonitorCode = [string](Get-SafePropertyValue -Object $ScreenItem -Name 'MonitorCode' -DefaultValue '')
         $existing.ZonePreset = [string]$ZonePreset
         if ($relativeRect) {
             $existing.RelativeLeft = [double]$relativeRect.RelativeLeft
@@ -1577,6 +2147,7 @@ function Set-WindowRuleForProfile {
             Width = [int]$targetRect.Width
             Height = [int]$targetRect.Height
             AssignedMonitor = [string]$ScreenItem.DeviceName
+            AssignedMonitorCode = [string](Get-SafePropertyValue -Object $ScreenItem -Name 'MonitorCode' -DefaultValue '')
             ZonePreset = [string]$ZonePreset
             RelativeLeft = if ($relativeRect) { [double]$relativeRect.RelativeLeft } else { -1.0 }
             RelativeTop = if ($relativeRect) { [double]$relativeRect.RelativeTop } else { -1.0 }
@@ -1655,6 +2226,7 @@ function Update-WindowRulePlacement {
     $rule.Width = [int]$targetRect.Width
     $rule.Height = [int]$targetRect.Height
     $rule.AssignedMonitor = [string]$AssignedMonitor
+    $rule.AssignedMonitorCode = [string](Get-SafePropertyValue -Object $screenItem -Name 'MonitorCode' -DefaultValue '')
     $rule.ZonePreset = [string]$ZonePreset
     if ($relativeRect) {
         $rule.RelativeLeft = [double]$relativeRect.RelativeLeft
@@ -1815,13 +2387,13 @@ function Remove-WindowRuleFromProfile {
 
                 <TextBlock Grid.Row="0" Text="Multi-Monitor Tool" FontSize="16" FontWeight="SemiBold" Margin="4,2,4,14" TextWrapping="Wrap"/>
 
-                <Button x:Name="BtnNavDashboard" Grid.Row="1" Margin="4" Content="Dashboard" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnNavEditor" Grid.Row="2" Margin="4" Content="Layout-Editor" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnNavProfiles" Grid.Row="3" Margin="4" Content="Profile" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnNavSettings" Grid.Row="4" Margin="4,4,4,0" VerticalAlignment="Top" Content="Einstellungen" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnSaveSettings" Grid.Row="5" Margin="4,12,4,0" Background="#16A34A" BorderBrush="#16A34A" Content="Speichern" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnHeaderReload" Grid.Row="6" Margin="4" Background="#475569" BorderBrush="#475569" Content="GUI neu starten" HorizontalContentAlignment="Left" FontSize="12"/>
-                <Button x:Name="BtnNavHelp" Grid.Row="8" Margin="4" Background="#475569" BorderBrush="#475569" Content="Hilfe / Tutorial" HorizontalContentAlignment="Left" FontSize="12"/>
+                <Button x:Name="BtnNavDashboard" Grid.Row="1" Margin="4" Content="Dashboard" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Übersicht: Bildschirme, Schnellaktionen und Aktivitätsprotokoll"/>
+                <Button x:Name="BtnNavEditor" Grid.Row="2" Margin="4" Content="Layout-Editor" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Lege fest, welches Programm auf welchem Monitor in welcher Position starten soll"/>
+                <Button x:Name="BtnNavProfiles" Grid.Row="3" Margin="4" Content="Profile" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Profile erstellen, umbenennen und verwalten"/>
+                <Button x:Name="BtnNavSettings" Grid.Row="4" Margin="4,4,4,0" VerticalAlignment="Top" Content="Einstellungen" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Wartezeiten, Autostart und Sprache konfigurieren"/>
+                <Button x:Name="BtnSaveSettings" Grid.Row="5" Margin="4,12,4,0" Background="#16A34A" BorderBrush="#16A34A" Content="Speichern" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Alle Einstellungen dauerhaft speichern"/>
+                <Button x:Name="BtnHeaderReload" Grid.Row="6" Margin="4" Background="#475569" BorderBrush="#475569" Content="GUI neu starten" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Tool komplett neu starten – nützlich nach Änderungen an der Konfigurationsdatei"/>
+                <Button x:Name="BtnNavHelp" Grid.Row="8" Margin="4" Background="#475569" BorderBrush="#475569" Content="Hilfe / Tutorial" HorizontalContentAlignment="Left" FontSize="12" ToolTip="Schritt-für-Schritt-Anleitung für Einsteiger"/>
 
                 <Border Grid.Row="9" Margin="4" Padding="10" CornerRadius="8" BorderBrush="#1E3A5F" BorderThickness="1" Background="#0B2744">
                     <StackPanel>
@@ -1912,7 +2484,7 @@ function Remove-WindowRuleFromProfile {
                                 <GridView>
                                     <GridViewColumn Header="Monitor" Width="250" DisplayMemberBinding="{Binding DisplayLabel}"/>
                                     <GridViewColumn Header="Typ" Width="110" DisplayMemberBinding="{Binding RoleName}"/>
-                                    <GridViewColumn Header="Primaer" Width="70" DisplayMemberBinding="{Binding Primary}"/>
+                                    <GridViewColumn Header="Haupt" Width="70" DisplayMemberBinding="{Binding Primary}"/>
                                     <GridViewColumn Header="Bounds" Width="190" DisplayMemberBinding="{Binding BoundsText}"/>
                                     <GridViewColumn Header="WorkArea" Width="190" DisplayMemberBinding="{Binding WorkText}"/>
                                 </GridView>
@@ -1920,20 +2492,20 @@ function Remove-WindowRuleFromProfile {
                         </ListView>
                     </GroupBox>
 
-                    <GroupBox Header="Schnellaktionen" Grid.Column="1">
+                    <GroupBox Header="Was möchtest du tun?" Grid.Column="1">
                         <StackPanel Margin="8">
-                            <Button x:Name="BtnRefresh" Margin="0,0,0,8" Content="Monitor-Scan"/>
-                            <Button x:Name="BtnSwitchAlltag" Margin="0,0,0,8" Content="Modus Alltag"/>
-                            <Button x:Name="BtnSwitchStreaming" Margin="0,0,0,8" Content="Modus Streaming/Gaming"/>
-                            <Button x:Name="BtnCaptureActive" Margin="0,0,0,8" Content="Layout aktives Profil speichern"/>
-                            <Button x:Name="BtnApplyActive" Margin="0,0,0,8" Content="Layout aktives Profil anwenden"/>
-                            <Button x:Name="BtnRescue" Margin="0,0,0,8" Background="#16A34A" BorderBrush="#16A34A" Content="Fenster retten"/>
-                            <Button x:Name="BtnExit" Margin="0,12,0,0" Background="#7F1D1D" BorderBrush="#7F1D1D" Content="Beenden"/>
+                            <Button x:Name="BtnRefresh" Margin="0,0,0,8" Content="Monitor-Scan" ToolTip="Alle angeschlossenen Bildschirme neu erkennen und die Anzeige aktualisieren"/>
+                            <Button x:Name="BtnSwitchAlltag" Margin="0,0,0,8" Content="Modus Alltag" ToolTip="Profil 'Alltag' aktivieren: schaltet auf den Hauptmonitor und stellt die gespeicherten Fenster wieder her"/>
+                            <Button x:Name="BtnSwitchStreaming" Margin="0,0,0,8" Content="Modus Streaming/Gaming" ToolTip="Profil 'Streaming/Gaming' aktivieren: schaltet alle Bildschirme ein und stellt die Fenster wieder her"/>
+                            <Button x:Name="BtnCaptureActive" Margin="0,0,0,8" Content="Layout aktives Profil speichern" ToolTip="Merkt sich die aktuelle Position und Größe aller offenen Fenster für das aktive Profil"/>
+                            <Button x:Name="BtnApplyActive" Margin="0,0,0,8" Content="Layout aktives Profil anwenden" ToolTip="Verschiebt alle Fenster auf ihre gespeicherten Positionen – fehlende Programme werden automatisch gestartet"/>
+                            <Button x:Name="BtnRescue" Margin="0,0,0,8" Background="#16A34A" BorderBrush="#16A34A" Content="Fenster retten" ToolTip="Fenster, die außerhalb des sichtbaren Bereichs liegen, auf den Hauptmonitor zurückholen"/>
+                            <Button x:Name="BtnExit" Margin="0,12,0,0" Background="#7F1D1D" BorderBrush="#7F1D1D" Content="Beenden" ToolTip="Das Tool beenden"/>
                         </StackPanel>
                     </GroupBox>
                 </Grid>
 
-                <GroupBox Grid.Row="3" Header="Live-Log" Margin="0,10,0,0">
+                <GroupBox Grid.Row="3" Header="Aktivitätsprotokoll" Margin="0,10,0,0">
                     <TextBox x:Name="TxtLog" Margin="6" Background="#020617" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Height="130"/>
                 </GroupBox>
             </Grid>
@@ -1957,7 +2529,7 @@ function Remove-WindowRuleFromProfile {
                             <Button x:Name="BtnEditorRefreshRules" Margin="8,0,0,0" Content="Regeln anzeigen"/>
                             <Button x:Name="BtnEditorSaveProfile" Margin="8,0,0,0" Background="#16A34A" BorderBrush="#16A34A" Content="Profil speichern"/>
                         </StackPanel>
-                        <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Text="Apps links ziehen und auf Monitor droppen"/>
+                        <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Text="① Programm links wählen  ② auf Monitor ziehen  ③ Zone auswählen"/>
                     </Grid>
                 </GroupBox>
 
@@ -1968,13 +2540,13 @@ function Remove-WindowRuleFromProfile {
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
 
-                    <GroupBox Grid.Column="0" Header="Geoeffnete Programme">
+                    <GroupBox Grid.Column="0" Header="Offene Programme">
                         <Grid Margin="8">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="*"/>
                             </Grid.RowDefinitions>
-                            <Button x:Name="BtnRefreshWindows" Grid.Row="0" Margin="0,0,0,8" Content="Programme aktualisieren"/>
+                            <Button x:Name="BtnRefreshWindows" Grid.Row="0" Margin="0,0,0,8" Content="Programme aktualisieren" ToolTip="Liste der aktuell geöffneten Programme neu laden"/>
                             <ListBox x:Name="LbOpenWindows" Grid.Row="1">
                                 <ListBox.ItemContainerStyle>
                                     <Style TargetType="ListBoxItem">
@@ -2001,7 +2573,7 @@ function Remove-WindowRuleFromProfile {
                         </Grid>
                     </GroupBox>
 
-                    <GroupBox Grid.Column="2" Header="Dynamische Monitorflaeche" MinHeight="380">
+                    <GroupBox Grid.Column="2" Header="Monitor-Zuordnung  (Programm hierhin ziehen)" MinHeight="380">
                         <Grid Margin="8">
                             <Canvas x:Name="CanvasLayout" Background="#0B1324" MinHeight="320"/>
                             <Border x:Name="ZonePicker" Visibility="Collapsed" Background="#111827" BorderBrush="#0EA5E9" BorderThickness="1" CornerRadius="8" Padding="8" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="10">
@@ -2030,11 +2602,11 @@ function Remove-WindowRuleFromProfile {
 
                 <GroupBox Header="Profilverwaltung" Grid.Row="0" Margin="0,0,0,10">
                     <StackPanel Orientation="Horizontal" Margin="8">
-                        <Button x:Name="BtnAddProfile" Margin="0,0,8,0" Content="Neues Profil"/>
-                        <Button x:Name="BtnDeleteProfile" Margin="0,0,8,0" Background="#7F1D1D" BorderBrush="#7F1D1D" Content="Profil loeschen"/>
-                        <Button x:Name="BtnSetActiveProfile" Margin="0,0,8,0" Content="Als aktiv setzen"/>
-                        <Button x:Name="BtnCaptureProfile" Margin="0,0,8,0" Content="Layout speichern"/>
-                        <Button x:Name="BtnApplyProfile" Content="Layout anwenden"/>
+                        <Button x:Name="BtnAddProfile" Margin="0,0,8,0" Content="Neues Profil" ToolTip="Neues Profil anlegen (z.B. 'Arbeit', 'Gaming', 'Präsentation')"/>
+                        <Button x:Name="BtnDeleteProfile" Margin="0,0,8,0" Background="#7F1D1D" BorderBrush="#7F1D1D" Content="Profil loeschen" ToolTip="Das markierte Profil dauerhaft löschen"/>
+                        <Button x:Name="BtnSetActiveProfile" Margin="0,0,8,0" Content="Als aktiv setzen" ToolTip="Dieses Profil als aktuell aktiv festlegen – wird im Dashboard angezeigt"/>
+                        <Button x:Name="BtnCaptureProfile" Margin="0,0,8,0" Content="Layout speichern" ToolTip="Aktuelle Fensterpos. für das markierte Profil merken"/>
+                        <Button x:Name="BtnApplyProfile" Content="Layout anwenden" ToolTip="Gespeicherte Fensteranordnung des markierten Profils wiederherstellen"/>
                     </StackPanel>
                 </GroupBox>
 
@@ -2068,8 +2640,8 @@ function Remove-WindowRuleFromProfile {
                     <ListView.View>
                         <GridView>
                             <GridViewColumn Header="Profil" Width="220" DisplayMemberBinding="{Binding Name}"/>
-                            <GridViewColumn Header="DisplayMode" Width="140" DisplayMemberBinding="{Binding DisplayMode}"/>
-                            <GridViewColumn Header="Regeln" Width="90" DisplayMemberBinding="{Binding RuleCount}"/>
+                            <GridViewColumn Header="Bildschirmmodus" Width="140" DisplayMemberBinding="{Binding DisplayMode}"/>
+                            <GridViewColumn Header="Fenster" Width="90" DisplayMemberBinding="{Binding RuleCount}"/>
                             <GridViewColumn Header="Aktiv" Width="80" DisplayMemberBinding="{Binding IsActive}"/>
                         </GridView>
                     </ListView.View>
@@ -2093,6 +2665,7 @@ function Remove-WindowRuleFromProfile {
                             <TextBlock x:Name="TxtConfigPath" Foreground="#E2E8F0" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,10"/>
                             <CheckBox x:Name="ChkAutoRestore" Foreground="#E2E8F0" Content="Layout nach Moduswechsel automatisch wiederherstellen" Margin="0,0,0,8"/>
                             <CheckBox x:Name="ChkAutoLaunchMissing" Foreground="#E2E8F0" Content="Fehlende Programme beim Profil anwenden automatisch starten" Margin="0,0,0,8"/>
+                            <CheckBox x:Name="ChkPromptBeforeCloseAll" Foreground="#E2E8F0" Content="Vor Profilstart nach dem Schließen aller offenen Fenster fragen" Margin="0,0,0,8"/>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock x:Name="TxtDelayLabel" VerticalAlignment="Center" Margin="0,0,8,0" Text="Verzoegerung (ms):"/>
                                 <TextBox x:Name="TxtDelay" Width="120"/>
@@ -2106,6 +2679,7 @@ function Remove-WindowRuleFromProfile {
                                 <ComboBox x:Name="CmbLanguage" Width="120"/>
                             </StackPanel>
                             <CheckBox x:Name="ChkRunAtStartup" Foreground="#E2E8F0" Content="Mit Windows starten" Margin="0,8,0,0"/>
+                            <CheckBox x:Name="ChkStartMinimized" Foreground="#E2E8F0" Content="Bei Windows-Start minimiert im Tray starten" Margin="0,8,0,0"/>
                         </StackPanel>
 
                         <GroupBox x:Name="GrpExcludedProcesses" Grid.Column="1" Header="Excluded Processes">
@@ -2150,20 +2724,20 @@ function Remove-WindowRuleFromProfile {
 
                     <GroupBox Header="Schritt-fuer-Schritt" Grid.Column="0" Margin="0,0,10,0">
                         <StackPanel Margin="10">
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="1. Gehe auf Dashboard und druecke Monitor-Scan, damit alle Bildschirme erkannt werden."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="2. Gehe auf Profile und setze dein gewuenschtes Arbeitsprofil als aktiv."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="3. Gehe auf Layout-Editor und aktualisiere Geoeffnete Programme."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="4. Ziehe ein Programm links auf den passenden Monitor rechts und waehle eine Zone (z. B. LeftHalf oder Fullscreen)."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="5. Speichere und teste im Dashboard mit Layout aktives Profil anwenden."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="1. Dashboard öffnen → 'Monitore erkennen' drücken, damit alle Bildschirme gefunden werden."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="2. Profile öffnen → gewünschtes Profil markieren → 'Als aktiv setzen' klicken."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="3. Layout-Editor öffnen → 'Offene Programme laden' klicken."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="4. Ein Programm links per Drag &amp; Drop auf einen Monitor ziehen → Zone auswählen (z. B. 'LeftHalf' = linke Hälfte, 'Fullscreen' = Vollbild)."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="5. 'Profil speichern' klicken und im Dashboard 'Fenster jetzt anordnen' testen."/>
                         </StackPanel>
                     </GroupBox>
 
                     <GroupBox Header="Wichtige Hinweise" Grid.Column="1">
                         <StackPanel Margin="10">
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Wenn Fenster verschwinden: nutze Fenster retten im Dashboard."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Beamer nur bei Bedarf: nutze Modus Alltag fuer den normalen Betrieb."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Wenn ein Programm nicht erscheint: oeffne es zuerst sichtbar und aktualisiere dann die Programmliste."/>
-                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Profil-Idee: Alltag fuer Arbeit, Streaming/Gaming fuer Beamer-Setups."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Fenster verschwunden? → 'Fenster auf Hauptmonitor holen' im Dashboard drücken."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Beamer-Betrieb: 'Profil: Streaming/Gaming starten' schaltet alle Bildschirme ein. 'Profil: Alltag starten' kehrt zum Hauptmonitor zurück."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Programm erscheint nicht? Öffne es zuerst und klicke dann im Layout-Editor 'Offene Programme laden'."/>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Text="Rechtsklick auf eine Zuordnung im Layout-Editor entfernt sie wieder."/>
                         </StackPanel>
                     </GroupBox>
                 </Grid>
@@ -2192,7 +2766,7 @@ $controls = @{}
     'CmbEditorProfile','BtnEditorRefreshRules','BtnEditorSaveProfile','BtnRefreshWindows','LbOpenWindows','CanvasLayout','ZonePicker','TxtZoneTarget','CanvasZonePreview',
     'BtnZoneCancel',
     'BtnAddProfile','BtnDeleteProfile','BtnSetActiveProfile','BtnCaptureProfile','BtnApplyProfile','LvProfiles',
-    'TxtConfigPath','ChkAutoRestore','ChkAutoLaunchMissing','TxtDelayLabel','TxtDelay','TxtLaunchDelayLabel','TxtLaunchDelay','TxtLanguageLabel','CmbLanguage','BtnSaveSettings','ChkRunAtStartup','GrpExcludedProcesses','TxtExcludedHint','LbExcluded','TxtExcludedNew','BtnExcludedAdd','BtnExcludedRemove'
+    'TxtConfigPath','ChkAutoRestore','ChkAutoLaunchMissing','ChkPromptBeforeCloseAll','TxtDelayLabel','TxtDelay','TxtLaunchDelayLabel','TxtLaunchDelay','TxtLanguageLabel','CmbLanguage','BtnSaveSettings','ChkRunAtStartup','ChkStartMinimized','GrpExcludedProcesses','TxtExcludedHint','LbExcluded','TxtExcludedNew','BtnExcludedAdd','BtnExcludedRemove'
     ,'BtnHelpToDashboard','BtnHelpToEditor'
 ) | ForEach-Object {
     $controls[$_] = $window.FindName($_)
@@ -2211,6 +2785,10 @@ $script:dragChip = $null
 $script:dragChipStartPoint = $null
 $script:dragChipStartLeft = 0
 $script:dragChipStartTop = 0
+$script:liveZoneOverlay = $null
+$script:trayIcon = $null
+$script:trayContextMenu = $null
+$script:trayProfilesMenuItem = $null
 
 function Write-Log {
     param([string]$Message)
@@ -2227,6 +2805,158 @@ function Write-EditorLog {
     $controls.TxtEditorLog.ScrollToEnd()
 }
 
+function Show-MainWindowFromTray {
+    if ($null -eq $window) { return }
+
+    $window.ShowInTaskbar = $true
+    $window.WindowState = [System.Windows.WindowState]::Normal
+    $window.Show()
+    $window.Activate() | Out-Null
+    $window.Focus() | Out-Null
+}
+
+function Hide-MainWindowToTray {
+    if ($null -eq $window) { return }
+
+    $window.Hide()
+    $window.ShowInTaskbar = $false
+}
+
+function Invoke-ApplyProfileLayout {
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [switch]$FromTray
+    )
+
+    try {
+        $profile = Get-Profile -Config $config -Name $ProfileName
+        if (-not $profile) {
+            throw "Profil '$ProfileName' nicht gefunden."
+        }
+
+        $previousProfile = Get-ActiveProfileName -Config $config
+        if (-not (Prepare-ProfileStart -Config $config -ProfileName $ProfileName -PreviousProfileName $previousProfile)) {
+            return
+        }
+
+        $config.ActiveProfile = $ProfileName
+        Save-Config -Config $config -Path $ConfigPath
+
+        $result = Restore-Layout -Config $config -ProfileName $ProfileName -Detailed
+
+        Update-ProfileSelectors
+        Update-ProfileList
+        Refresh-DashboardCards
+        Render-LayoutCanvas
+
+        $summary = "Layout fuer $ProfileName angewendet: verschoben=$($result.Moved), gestartet=$($result.Launched), nicht gefunden=$($result.Missing), ungueltige Regeln=$($result.Invalid)."
+        Write-Log $summary
+
+        if ($FromTray.IsPresent -and $null -ne $script:trayIcon) {
+            $script:trayIcon.ShowBalloonTip(1800, 'Multi-Monitor Profile Tool', "Profil '$ProfileName' wurde angewendet.", [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    }
+    catch {
+        $errorMsg = "Profil $ProfileName konnte nicht angewendet werden: $($_.Exception.Message)"
+        Write-Log $errorMsg
+        if ($FromTray.IsPresent -and $null -ne $script:trayIcon) {
+            $script:trayIcon.ShowBalloonTip(2200, 'Multi-Monitor Profile Tool', $errorMsg, [System.Windows.Forms.ToolTipIcon]::Error)
+        }
+    }
+}
+
+function Update-TrayProfileMenu {
+    if ($null -eq $script:trayProfilesMenuItem) { return }
+
+    $script:trayProfilesMenuItem.DropDownItems.Clear()
+
+    $profiles = @($config.Profiles)
+    if ($profiles.Count -eq 0) {
+        $emptyItem = New-Object System.Windows.Forms.ToolStripMenuItem('(keine Profile)')
+        $emptyItem.Enabled = $false
+        $script:trayProfilesMenuItem.DropDownItems.Add($emptyItem) | Out-Null
+        return
+    }
+
+    $active = Get-ActiveProfileName -Config $config
+    foreach ($p in $profiles) {
+        $name = [string]$p.Name
+        $item = New-Object System.Windows.Forms.ToolStripMenuItem($name)
+        $item.Tag = $name
+        $item.Checked = ($name -eq $active)
+        $item.Add_Click({
+            param($sender, $eventArgs)
+            $selectedName = [string]$sender.Tag
+            Invoke-ApplyProfileLayout -ProfileName $selectedName -FromTray
+            Update-TrayProfileMenu
+        }) | Out-Null
+        $script:trayProfilesMenuItem.DropDownItems.Add($item) | Out-Null
+    }
+}
+
+function Update-TrayContextMenu {
+    if ($null -eq $script:trayContextMenu) { return }
+
+    $script:trayContextMenu.Items.Clear()
+
+    $openItem = $script:trayContextMenu.Items.Add((T 'tray_open'))
+    $openItem.Add_Click({ Show-MainWindowFromTray }) | Out-Null
+
+    $applyActiveItem = $script:trayContextMenu.Items.Add((T 'tray_apply_active'))
+    $applyActiveItem.Add_Click({
+        $activeName = Get-ActiveProfileName -Config $config
+        Invoke-ApplyProfileLayout -ProfileName $activeName -FromTray
+        Update-TrayProfileMenu
+    }) | Out-Null
+
+    $script:trayProfilesMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem((T 'tray_profiles'))
+    $script:trayContextMenu.Items.Add($script:trayProfilesMenuItem) | Out-Null
+    Update-TrayProfileMenu
+
+    $script:trayContextMenu.Items.Add('-') | Out-Null
+
+    $exitItem = $script:trayContextMenu.Items.Add((T 'tray_exit'))
+    $exitItem.Add_Click({
+        if ($null -ne $script:trayIcon) {
+            $script:trayIcon.Visible = $false
+            $script:trayIcon.Dispose()
+            $script:trayIcon = $null
+        }
+        $window.Close()
+    }) | Out-Null
+}
+
+function Initialize-TrayIcon {
+    if ($null -ne $script:trayIcon) {
+        return
+    }
+
+    $script:trayContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+
+    $icon = [System.Drawing.SystemIcons]::Application
+    try {
+        $proc = Get-Process -Id $PID -ErrorAction Stop
+        if ($null -ne $proc.MainModule -and -not [string]::IsNullOrWhiteSpace($proc.MainModule.FileName)) {
+            $extracted = [System.Drawing.Icon]::ExtractAssociatedIcon($proc.MainModule.FileName)
+            if ($null -ne $extracted) {
+                $icon = $extracted
+            }
+        }
+    }
+    catch {
+        # Fallback auf System-Icon.
+    }
+
+    $script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
+    $script:trayIcon.Text = 'Multi-Monitor Profile Tool'
+    $script:trayIcon.Icon = $icon
+    $script:trayIcon.ContextMenuStrip = $script:trayContextMenu
+    $script:trayIcon.Visible = $true
+    $script:trayIcon.Add_DoubleClick({ Show-MainWindowFromTray }) | Out-Null
+
+    Update-TrayContextMenu
+}
+
 $script:i18n = @{
     de = @{
         window_title = 'Multi-Monitor Profile Tool'
@@ -2236,39 +2966,45 @@ $script:i18n = @{
         nav_profiles = 'Profile'
         nav_settings = 'Einstellungen'
         nav_help = 'Hilfe / Tutorial'
-        btn_header_reload = 'GUI neu starten'
-        btn_refresh = 'Monitor-Scan'
-        btn_switch_alltag = 'Modus Alltag'
-        btn_switch_streaming = 'Modus Streaming/Gaming'
-        btn_capture_active = 'Layout aktives Profil speichern'
-        btn_apply_active = 'Layout aktives Profil anwenden'
-        btn_rescue = 'Fenster retten'
+        btn_header_reload = 'Tool neu laden'
+        btn_refresh = 'Monitore erkennen'
+        btn_switch_alltag = 'Profil: Alltag starten'
+        btn_switch_streaming = 'Profil: Streaming/Gaming starten'
+        btn_capture_active = 'Aktuelle Positionen merken'
+        btn_apply_active = 'Fenster jetzt anordnen'
+        btn_rescue = 'Fenster auf Hauptmonitor holen'
         btn_exit = 'Beenden'
-        btn_refresh_windows = 'Programme aktualisieren'
+        btn_refresh_windows = 'Offene Programme laden'
         btn_zone_cancel = 'Abbrechen'
-        btn_editor_refresh = 'Regeln anzeigen'
+        btn_editor_refresh = 'Zuordnungen anzeigen'
         btn_editor_save = 'Profil speichern'
         btn_add_profile = 'Neues Profil'
         btn_delete_profile = 'Profil loeschen'
         btn_set_active_profile = 'Als aktiv setzen'
-        btn_capture_profile = 'Layout speichern'
-        btn_apply_profile = 'Layout anwenden'
-        chk_auto_restore = 'Layout nach Moduswechsel automatisch wiederherstellen'
-        chk_auto_launch = 'Fehlende Programme beim Profil anwenden automatisch starten'
-        lbl_delay = 'Verzoegerung (ms):'
-        lbl_launch_delay = 'Startwartezeit (ms):'
+        btn_capture_profile = 'Positionen merken'
+        btn_apply_profile = 'Positionen anwenden'
+        chk_auto_restore = 'Fenster nach Moduswechsel automatisch wiederherstellen'
+        chk_auto_launch = 'Fehlende Programme beim Anwenden automatisch starten'
+        chk_prompt_before_close_all = 'Vor Profilwechsel fragen, ob offene Fenster geschlossen werden sollen'
+        lbl_delay = 'Wartezeit bei Moduswechsel (ms):'
+        lbl_launch_delay = 'Wartezeit beim Programmstart (ms):'
         lbl_language = 'Sprache:'
         btn_save_settings = 'Speichern'
-        grp_excluded_processes = 'Ausgeschlossene Prozesse'
-        txt_excluded_hint = 'Systemprozesse hier eintragen, die nie erfasst oder verschoben werden sollen. Normale Apps wie Code oder Browser nicht hinzufuegen.'
+        grp_excluded_processes = 'Systemprozesse ignorieren'
+        txt_excluded_hint = 'Prozesse hier eintragen, die das Tool niemals erfassen oder verschieben soll (z.B. Systemdienste). Normale Programme wie Browser oder Editoren bitte NICHT eintragen.'
         btn_excluded_add = 'Hinzufuegen'
         btn_excluded_remove = 'Entfernen'
-        chk_run_at_startup = 'Mit Windows starten'
+        chk_run_at_startup = 'Automatisch mit Windows starten'
+        chk_start_minimized = 'Beim Start minimiert im Infobereich (Tray) starten'
+        tray_open = 'Oeffnen'
+        tray_apply_active = 'Aktives Profil anwenden'
+        tray_profiles = 'Profil wechseln'
+        tray_exit = 'Beenden'
         btn_help_to_dashboard = 'Zum Dashboard'
         btn_help_to_editor = 'Zum Layout-Editor'
-        grp_editor_log = 'Editor-Log'
-        editor_log_started = 'Editor-Log bereit. Aktionen im Layout-Editor werden hier angezeigt.'
-        log_tool_started = 'Tool gestartet. Nutze den Layout-Editor fuer Drag-and-Drop-Zonen je Profil.'
+        grp_editor_log = 'Aktivitätsprotokoll'
+        editor_log_started = 'Bereit. Zuordnungen und Aktionen im Editor werden hier protokolliert.'
+        log_tool_started = 'Tool gestartet. Tipp: Öffne Hilfe/Tutorial wenn du das Tool zum ersten Mal verwendest.'
     }
     en = @{
         window_title = 'Multi-Monitor Profile Tool'
@@ -2278,39 +3014,45 @@ $script:i18n = @{
         nav_profiles = 'Profiles'
         nav_settings = 'Settings'
         nav_help = 'Help / Tutorial'
-        btn_header_reload = 'Restart GUI'
-        btn_refresh = 'Scan monitors'
-        btn_switch_alltag = 'Work mode'
-        btn_switch_streaming = 'Streaming/Gaming mode'
-        btn_capture_active = 'Save active profile layout'
-        btn_apply_active = 'Apply active profile layout'
-        btn_rescue = 'Rescue windows'
+        btn_header_reload = 'Reload tool'
+        btn_refresh = 'Detect monitors'
+        btn_switch_alltag = 'Profile: Start Everyday'
+        btn_switch_streaming = 'Profile: Start Streaming/Gaming'
+        btn_capture_active = 'Remember current positions'
+        btn_apply_active = 'Arrange windows now'
+        btn_rescue = 'Bring windows to main screen'
         btn_exit = 'Exit'
-        btn_refresh_windows = 'Refresh programs'
+        btn_refresh_windows = 'Load open programs'
         btn_zone_cancel = 'Cancel'
-        btn_editor_refresh = 'Show rules'
+        btn_editor_refresh = 'Show assignments'
         btn_editor_save = 'Save profile'
         btn_add_profile = 'New profile'
         btn_delete_profile = 'Delete profile'
         btn_set_active_profile = 'Set active'
-        btn_capture_profile = 'Save layout'
-        btn_apply_profile = 'Apply layout'
-        chk_auto_restore = 'Automatically restore layout after mode switch'
-        chk_auto_launch = 'Automatically launch missing programs when applying profile'
-        lbl_delay = 'Delay (ms):'
-        lbl_launch_delay = 'Launch wait (ms):'
+        btn_capture_profile = 'Remember positions'
+        btn_apply_profile = 'Apply positions'
+        chk_auto_restore = 'Automatically restore windows after mode switch'
+        chk_auto_launch = 'Automatically launch missing programs when applying'
+        chk_prompt_before_close_all = 'Ask before closing open windows on profile switch'
+        lbl_delay = 'Delay on mode switch (ms):'
+        lbl_launch_delay = 'Wait time on program launch (ms):'
         lbl_language = 'Language:'
         btn_save_settings = 'Save'
-        grp_excluded_processes = 'Excluded Processes'
-        txt_excluded_hint = 'Add system processes that should never be captured or moved. Do not add normal apps like Code or browsers.'
+        grp_excluded_processes = 'Ignore system processes'
+        txt_excluded_hint = 'Add processes the tool should never capture or move (e.g. system services). Do NOT add normal programs like browsers or editors.'
         btn_excluded_add = 'Add'
         btn_excluded_remove = 'Remove'
-        chk_run_at_startup = 'Run at Windows startup'
-        btn_help_to_dashboard = 'Go to dashboard'
-        btn_help_to_editor = 'Go to layout editor'
-        grp_editor_log = 'Editor Log'
-        editor_log_started = 'Editor log ready. Layout editor actions are shown here.'
-        log_tool_started = 'Tool started. Use the layout editor for drag-and-drop zones per profile.'
+        chk_run_at_startup = 'Start automatically with Windows'
+        chk_start_minimized = 'Start minimized to system tray'
+        tray_open = 'Open'
+        tray_apply_active = 'Apply active profile'
+        tray_profiles = 'Switch profile'
+        tray_exit = 'Exit'
+        btn_help_to_dashboard = 'Go to Dashboard'
+        btn_help_to_editor = 'Go to Layout Editor'
+        grp_editor_log = 'Activity Log'
+        editor_log_started = 'Ready. Assignments and actions in the editor are logged here.'
+        log_tool_started = 'Tool started. Tip: Open Help/Tutorial if you are using this tool for the first time.'
     }
 }
 
@@ -2362,6 +3104,7 @@ function Apply-UiLanguage {
     $controls.BtnApplyProfile.Content = T 'btn_apply_profile'
     $controls.ChkAutoRestore.Content = T 'chk_auto_restore'
     $controls.ChkAutoLaunchMissing.Content = T 'chk_auto_launch'
+    $controls.ChkPromptBeforeCloseAll.Content = T 'chk_prompt_before_close_all'
     $controls.TxtDelayLabel.Text = T 'lbl_delay'
     $controls.TxtLaunchDelayLabel.Text = T 'lbl_launch_delay'
     $controls.TxtLanguageLabel.Text = T 'lbl_language'
@@ -2371,6 +3114,7 @@ function Apply-UiLanguage {
     $controls.BtnExcludedAdd.Content = T 'btn_excluded_add'
     $controls.BtnExcludedRemove.Content = T 'btn_excluded_remove'
     $controls.ChkRunAtStartup.Content = T 'chk_run_at_startup'
+    $controls.ChkStartMinimized.Content = T 'chk_start_minimized'
 
     if ($controls.ContainsKey('BtnHelpToDashboard') -and $null -ne $controls['BtnHelpToDashboard']) {
         $controls['BtnHelpToDashboard'].Content = T 'btn_help_to_dashboard'
@@ -2381,6 +3125,10 @@ function Apply-UiLanguage {
 
     if ($controls.ContainsKey('GrpEditorLog') -and $null -ne $controls['GrpEditorLog']) {
         $controls.GrpEditorLog.Header = T 'grp_editor_log'
+    }
+
+    if ($null -ne $script:trayContextMenu) {
+        Update-TrayContextMenu
     }
 
     $controls.TxtConfigPath.Text = "$(T 'settings_path_prefix')`n$ConfigPath"
@@ -2429,16 +3177,23 @@ function Update-ProfileSelectors {
     elseif ($names.Count -gt 0) {
         $controls.CmbEditorProfile.SelectedIndex = 0
     }
+
+    Update-TrayProfileMenu
 }
 
 function Update-ProfileList {
     $active = Get-ActiveProfileName -Config $config
     $items = foreach ($p in $config.Profiles) {
+        $modeText = switch ([string]$p.DisplayMode) {
+            'internal' { 'Nur Hauptmonitor' }
+            'extend'   { 'Alle Bildschirme' }
+            default    { [string]$p.DisplayMode }
+        }
         [pscustomobject]@{
             Name = $p.Name
-            DisplayMode = $p.DisplayMode
+            DisplayMode = $modeText
             RuleCount = @($p.WindowLayouts).Count
-            IsActive = if ($p.Name -eq $active) { 'Ja' } else { 'Nein' }
+            IsActive = if ($p.Name -eq $active) { '✓ Aktiv' } else { '' }
         }
     }
     $controls.LvProfiles.ItemsSource = $items
@@ -2455,6 +3210,7 @@ function Refresh-DashboardCards {
 function Update-SettingsView {
     $controls.ChkAutoRestore.IsChecked = [bool]$config.Settings.RestoreAfterSwitch
     $controls.ChkAutoLaunchMissing.IsChecked = [bool](Get-SafePropertyValue -Object $config.Settings -Name 'AutoLaunchMissingWindows' -DefaultValue $true)
+    $controls.ChkPromptBeforeCloseAll.IsChecked = [bool](Get-SafePropertyValue -Object $config.Settings -Name 'PromptBeforeCloseAllWindows' -DefaultValue $true)
     $controls.TxtDelay.Text = [string]$config.Settings.SwitchDelayMs
     $controls.TxtLaunchDelay.Text = [string](Get-SafePropertyValue -Object $config.Settings -Name 'LaunchDelayMs' -DefaultValue 1800)
     $controls.CmbLanguage.ItemsSource = @(
@@ -2470,6 +3226,7 @@ function Update-SettingsView {
     $regName = 'MultiMonitorProfileTool'
     $regEntry = Get-ItemProperty -Path $regKey -Name $regName -ErrorAction SilentlyContinue
     $controls.ChkRunAtStartup.IsChecked = ($null -ne $regEntry)
+    $controls.ChkStartMinimized.IsChecked = [bool](Get-SafePropertyValue -Object $config.Settings -Name 'StartMinimizedWithWindows' -DefaultValue $false)
     Apply-UiLanguage
 }
 
@@ -2509,8 +3266,11 @@ function Restart-ToolProcess {
         '-File', "`"$PSCommandPath`"",
         '-ConfigPath', "`"$ConfigPath`""
     )
+    if ($StartMinimized.IsPresent) {
+        $argsList += '-StartMinimized'
+    }
 
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $argsList | Out-Null
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argsList -WindowStyle Hidden | Out-Null
     Write-Log 'GUI wird neu gestartet, um Code-Aenderungen zu uebernehmen...'
     $window.Close()
 }
@@ -2590,6 +3350,7 @@ function Get-CanvasZoneRect {
 function Render-LayoutCanvas {
     $controls.CanvasLayout.Children.Clear()
     $script:canvasScreenMap = @{}
+    $script:liveZoneOverlay = $null
 
     $screens = @(Get-Screens)
     if ($screens.Count -eq 0) { return }
@@ -2664,6 +3425,7 @@ function Render-LayoutCanvas {
 
         [System.Windows.Controls.Canvas]::SetLeft($border, $x)
         [System.Windows.Controls.Canvas]::SetTop($border, $y)
+        [System.Windows.Controls.Canvas]::SetZIndex($border, 1)
         $controls.CanvasLayout.Children.Add($border) | Out-Null
 
         $script:canvasScreenMap[$screen.DeviceName] = [pscustomobject]@{
@@ -2748,6 +3510,7 @@ function Render-LayoutCanvas {
 
         [System.Windows.Controls.Canvas]::SetLeft($zoneBlock, $zoneRect.X)
         [System.Windows.Controls.Canvas]::SetTop($zoneBlock, $zoneRect.Y)
+        [System.Windows.Controls.Canvas]::SetZIndex($zoneBlock, 10)
 
         $null = $zoneBlock.Add_MouseLeftButtonDown({
             param($sender, $e)
@@ -2756,6 +3519,7 @@ function Render-LayoutCanvas {
             $script:dragChipStartLeft = [double][System.Windows.Controls.Canvas]::GetLeft($sender)
             $script:dragChipStartTop = [double][System.Windows.Controls.Canvas]::GetTop($sender)
             $sender.Opacity = 0.85
+            [System.Windows.Controls.Canvas]::SetZIndex($sender, 30)
             $sender.CaptureMouse() | Out-Null
             $e.Handled = $true
         })
@@ -2798,10 +3562,12 @@ function Render-LayoutCanvas {
                 
                 # Zeige Zielinfo an
                 $displayLabel = if ([string]::IsNullOrWhiteSpace($zoneInfo.Monitor.DisplayLabel)) { $targetDeviceName } else { $zoneInfo.Monitor.DisplayLabel }
+                Show-LiveZoneOverlay -ZoneInfo $zoneInfo -LabelText "$($zoneInfo.Zone)`n$displayLabel"
                 if ($controls.ContainsKey('TxtZoneTarget')) {
                     $controls.TxtZoneTarget.Text = "Zielzone: $($zoneInfo.Zone) auf $displayLabel"
                 }
             } else {
+                Clear-LiveZoneOverlay
                 # Keine gültige Zone unter Maus
                 if ($controls.ContainsKey('TxtZoneTarget')) {
                     $controls.TxtZoneTarget.Text = "Keine gültige Monitor-Zone unter Maus"
@@ -2819,6 +3585,7 @@ function Render-LayoutCanvas {
                 $sender.ReleaseMouseCapture()
             }
             $sender.Opacity = 1
+            [System.Windows.Controls.Canvas]::SetZIndex($sender, 10)
 
             $left = [double][System.Windows.Controls.Canvas]::GetLeft($sender)
             $top = [double][System.Windows.Controls.Canvas]::GetTop($sender)
@@ -2847,6 +3614,7 @@ function Render-LayoutCanvas {
                 $border.BorderBrush = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(14,165,233))
                 $border.Opacity = 1.0
             }
+            Clear-LiveZoneOverlay
 
             $script:dragChip = $null
             Render-LayoutCanvas
@@ -2895,16 +3663,25 @@ function Apply-ZoneToPendingDrop {
 }
 
 function Switch-ToProfileDisplayMode {
-    param([Parameter(Mandatory)][string]$ProfileName)
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string]$PreviousProfileName = $null
+    )
     $profile = Get-Profile -Config $config -Name $ProfileName
     if (-not $profile) { throw "Profil '$ProfileName' nicht gefunden." }
-    Close-ProfileWindows -Config $config -ProfileName $ProfileName
+
+    if (-not (Prepare-ProfileStart -Config $config -ProfileName $ProfileName -PreviousProfileName $PreviousProfileName)) {
+        return $false
+    }
+    
     Set-DisplayMode -Mode $profile.DisplayMode
     Start-Sleep -Milliseconds ([int]$config.Settings.SwitchDelayMs)
     if ([bool]$config.Settings.RestoreAfterSwitch) {
         $result = Restore-Layout -Config $config -ProfileName $ProfileName -Detailed
         Write-Log "Layout fuer $ProfileName nach Moduswechsel: verschoben=$($result.Moved), gestartet=$($result.Launched), nicht gefunden=$($result.Missing), ungueltige Regeln=$($result.Invalid)."
     }
+
+    return $true
 }
 
 $controls.BtnNavDashboard.Add_Click({ Show-View -Name 'Dashboard' })
@@ -2938,9 +3715,11 @@ $controls.BtnSwitchAlltag.Add_Click({
     try {
         $profile = Get-Profile -Config $config -Name 'Alltag'
         if (-not $profile) { throw 'Profil Alltag fehlt.' }
+        $previousProfile = Get-ActiveProfileName -Config $config
+        $switched = Switch-ToProfileDisplayMode -ProfileName 'Alltag' -PreviousProfileName $previousProfile
+        if (-not $switched) { return }
         $config.ActiveProfile = 'Alltag'
         Save-Config -Config $config -Path $ConfigPath
-        Switch-ToProfileDisplayMode -ProfileName 'Alltag'
         Update-ScreenList
         Refresh-DashboardCards
         Update-ProfileList
@@ -2954,9 +3733,11 @@ $controls.BtnSwitchStreaming.Add_Click({
     try {
         $profile = Get-Profile -Config $config -Name 'StreamingGaming'
         if (-not $profile) { throw 'Profil StreamingGaming fehlt.' }
+        $previousProfile = Get-ActiveProfileName -Config $config
+        $switched = Switch-ToProfileDisplayMode -ProfileName 'StreamingGaming' -PreviousProfileName $previousProfile
+        if (-not $switched) { return }
         $config.ActiveProfile = 'StreamingGaming'
         Save-Config -Config $config -Path $ConfigPath
-        Switch-ToProfileDisplayMode -ProfileName 'StreamingGaming'
         Update-ScreenList
         Refresh-DashboardCards
         Update-ProfileList
@@ -2981,9 +3762,11 @@ $controls.BtnCaptureActive.Add_Click({
 })
 
 $controls.BtnApplyActive.Add_Click({
-        Close-ProfileWindows -Config $config -ProfileName $profileName
     try {
         $profileName = Get-ActiveProfileName -Config $config
+        if (-not (Prepare-ProfileStart -Config $config -ProfileName $profileName -PreviousProfileName $profileName)) {
+            return
+        }
         $result = Restore-Layout -Config $config -ProfileName $profileName -Detailed
         Write-Log "Layout fuer $profileName angewendet: verschoben=$($result.Moved), gestartet=$($result.Launched), nicht gefunden=$($result.Missing), ungueltige Regeln=$($result.Invalid)."
     }
@@ -2994,7 +3777,7 @@ $controls.BtnApplyActive.Add_Click({
 
 $controls.BtnRescue.Add_Click({
     try {
-        $moved = Rescue-WindowsToPrimary
+        $moved = Rescue-WindowsToPrimary -Config $config
         Write-Log "Fenster-Rettung abgeschlossen ($moved Fenster verschoben)."
     }
     catch {
@@ -3089,19 +3872,116 @@ $controls.BtnZoneCancel.Add_Click({
 
 $controls.BtnAddProfile.Add_Click({
     try {
-        $name = [Microsoft.VisualBasic.Interaction]::InputBox('Profilname eingeben:', 'Neues Profil', 'NeuesProfil')
-        if ([string]::IsNullOrWhiteSpace($name)) { return }
-        $name = $name.Trim()
+        [xml]$dlgXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Neues Profil" Height="270" Width="420"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#0B1220" FontFamily="Segoe UI" FontSize="13">
+    <Border Margin="24,20,24,24">
+        <StackPanel>
+            <TextBlock Text="Neues Profil anlegen" FontSize="16" FontWeight="SemiBold"
+                       Foreground="#E2E8F0" Margin="0,0,0,20"/>
+            <TextBlock Text="Profilname" Foreground="#94A3B8" FontSize="12" Margin="0,0,0,6"/>
+            <TextBox x:Name="TxtProfileName"
+                     Background="#0B1324" Foreground="#E2E8F0" CaretBrush="#E2E8F0"
+                     BorderBrush="#334155" BorderThickness="1"
+                     Padding="8,7" FontSize="13" FontFamily="Segoe UI"
+                     SelectionBrush="#0EA5E9"/>
+            <TextBlock x:Name="TxtDlgError" Foreground="#F87171" FontSize="11"
+                       Margin="0,8,0,0" Visibility="Collapsed" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0">
+                <Button x:Name="BtnDlgCancel" Content="Abbrechen" Width="110" Margin="0,0,10,0"
+                        Foreground="White" Background="#475569" BorderBrush="#475569"
+                        Padding="10,7" Cursor="Hand" FontFamily="Segoe UI" FontSize="13">
+                    <Button.Template>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="1" CornerRadius="8">
+                                <ContentPresenter HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center" Margin="2"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="Bd" Property="Background" Value="#64748B"/>
+                                    <Setter TargetName="Bd" Property="BorderBrush" Value="#64748B"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Button.Template>
+                </Button>
+                <Button x:Name="BtnDlgOk" Content="Erstellen" Width="110"
+                        Foreground="White" Background="#0EA5E9" BorderBrush="#0EA5E9"
+                        Padding="10,7" Cursor="Hand" FontFamily="Segoe UI" FontSize="13">
+                    <Button.Template>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="1" CornerRadius="8">
+                                <ContentPresenter HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center" Margin="2"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="Bd" Property="Background" Value="#0284C7"/>
+                                    <Setter TargetName="Bd" Property="BorderBrush" Value="#0284C7"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Button.Template>
+                </Button>
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>
+"@
+        $dlgReader  = [System.Xml.XmlNodeReader]::new($dlgXaml)
+        $dlg        = [Windows.Markup.XamlReader]::Load($dlgReader)
+        $dlg.Owner  = $window
+        $dlgTxt     = $dlg.FindName('TxtProfileName')
+        $dlgErr     = $dlg.FindName('TxtDlgError')
+        $dlgOk      = $dlg.FindName('BtnDlgOk')
+        $dlgCancel  = $dlg.FindName('BtnDlgCancel')
 
-        if ($config.Profiles | Where-Object { $_.Name -eq $name }) {
-            throw 'Profilname existiert bereits.'
+        $dlg.Add_Loaded({ $dlgTxt.Focus() })
+
+        # Fehlerhinweis beim Tippen ausblenden
+        $dlgTxt.Add_TextChanged({ $dlgErr.Visibility = 'Collapsed' })
+
+        # Validierung beim OK-Klick
+        $validateAndConfirm = {
+            $n = $dlgTxt.Text.Trim()
+            if ([string]::IsNullOrWhiteSpace($n)) {
+                $dlgErr.Text = 'Der Profilname darf nicht leer sein.'
+                $dlgErr.Visibility = 'Visible'
+                return
+            }
+            if ($config.Profiles | Where-Object { $_.Name -eq $n }) {
+                $dlgErr.Text = "Ein Profil mit dem Namen »$n« existiert bereits."
+                $dlgErr.Visibility = 'Visible'
+                return
+            }
+            $dlg.DialogResult = $true
         }
 
+        $dlgOk.Add_Click($validateAndConfirm)
+        $dlgCancel.Add_Click({ $dlg.Close() })
+
+        $dlgTxt.Add_KeyDown({
+            param($s, $e)
+            if ($e.Key -eq 'Return')  { & $validateAndConfirm }
+            elseif ($e.Key -eq 'Escape') { $dlg.Close() }
+        })
+
+        if ($dlg.ShowDialog() -ne $true) { return }
+
+        $name = $dlgTxt.Text.Trim()
         $mode = 'extend'
         if ($name -match 'alltag|work|office') { $mode = 'internal' }
 
         $config.Profiles += [ordered]@{
-            Name = $name
+            Name        = $name
             DisplayMode = $mode
             WindowLayouts = @()
         }
@@ -3175,12 +4055,22 @@ $controls.BtnCaptureProfile.Add_Click({
 })
 
 $controls.BtnApplyProfile.Add_Click({
-        Close-ProfileWindows -Config $config -ProfileName $name
     try {
         $selected = $controls.LvProfiles.SelectedItem
         $name = if ($selected) { [string]$selected.Name } else { Get-ActiveProfileName -Config $config }
         if ([string]::IsNullOrWhiteSpace($name)) { throw 'Kein aktives Profil verfuegbar.' }
+
+        $currentProfile = Get-ActiveProfileName -Config $config
+        if (-not (Prepare-ProfileStart -Config $config -ProfileName $name -PreviousProfileName $currentProfile)) {
+            return
+        }
+
         $result = Restore-Layout -Config $config -ProfileName $name -Detailed
+        $config.ActiveProfile = $name
+        Save-Config -Config $config -Path $ConfigPath
+        Update-ProfileSelectors
+        Update-ProfileList
+        Refresh-DashboardCards
         Write-Log "Layout fuer $name angewendet: verschoben=$($result.Moved), gestartet=$($result.Launched), nicht gefunden=$($result.Missing), ungueltige Regeln=$($result.Invalid)."
     }
     catch {
@@ -3207,8 +4097,10 @@ $controls.BtnSaveSettings.Add_Click({
 
         $config.Settings.RestoreAfterSwitch = [bool]$controls.ChkAutoRestore.IsChecked
         $config.Settings.AutoLaunchMissingWindows = [bool]$controls.ChkAutoLaunchMissing.IsChecked
+        $config.Settings.PromptBeforeCloseAllWindows = [bool]$controls.ChkPromptBeforeCloseAll.IsChecked
         $config.Settings.SwitchDelayMs = $delay
         $config.Settings.LaunchDelayMs = $launchDelay
+        $config.Settings.StartMinimizedWithWindows = [bool]$controls.ChkStartMinimized.IsChecked
         $selectedLanguage = [string]$controls.CmbLanguage.SelectedValue
         if (@('de','en') -notcontains $selectedLanguage) {
             $selectedLanguage = 'de'
@@ -3288,8 +4180,17 @@ Refresh-DashboardCards
 Refresh-OpenWindows
 Render-LayoutCanvas
 Show-View -Name 'Dashboard'
+Initialize-TrayIcon
 Write-Log (T 'log_tool_started')
 Write-EditorLog (T 'editor_log_started')
+
+$window.Add_Closing({
+    if ($null -ne $script:trayIcon) {
+        $script:trayIcon.Visible = $false
+        $script:trayIcon.Dispose()
+        $script:trayIcon = $null
+    }
+})
 
 $window.Add_ContentRendered({
     try {
@@ -3313,6 +4214,13 @@ $window.Add_ContentRendered({
         $window.Activate() | Out-Null
         $window.Focus() | Out-Null
         $window.Topmost = $false
+
+        if ($StartMinimized.IsPresent -and [bool](Get-SafePropertyValue -Object $config.Settings -Name 'StartMinimizedWithWindows' -DefaultValue $false)) {
+            Hide-MainWindowToTray
+            if ($null -ne $script:trayIcon) {
+                $script:trayIcon.ShowBalloonTip(2400, 'Multi-Monitor Profile Tool', 'Start ohne Profil-Laden. Profile kannst du direkt ueber das Tray-Icon umschalten.', [System.Windows.Forms.ToolTipIcon]::Info)
+            }
+        }
     }
     catch {
         Write-Log "Hinweis: Sichtbarkeits-Start konnte nicht vollständig angewendet werden: $($_.Exception.Message)"
