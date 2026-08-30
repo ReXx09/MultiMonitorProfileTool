@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputPath = "$PSScriptRoot\MultiMonitorProfileTool.ico",
     [int]$Size = 256
 )

@@ -430,7 +430,7 @@ function Load-Config {
         return $cfg
     }
     catch {
-        [System.Windows.MessageBox]::Show("Fehler beim Laden der Konfiguration:`n$($_.Exception.Message)", 'Konfigurationsfehler', 'OK', 'Error') | Out-Null
+        Show-ModernMessageDialog -Arguments @("Fehler beim Laden der Konfiguration:`n$($_.Exception.Message)", 'Konfigurationsfehler', 'OK', 'Error') | Out-Null
         $backup = "$Path.corrupt.$(Get-Date -Format 'yyyyMMdd_HHmmss').bak"
         try { Copy-Item -LiteralPath $Path -Destination $backup -ErrorAction SilentlyContinue } catch {}
         $cfg = New-DefaultConfig
@@ -1195,7 +1195,7 @@ function Prepare-ProfileStart {
         'Abbrechen = Profilstart abbrechen.'
     ) -join "`r`n"
 
-    $decision = [System.Windows.MessageBox]::Show(
+    $decision = Show-ModernMessageDialog -Arguments @(
         $message,
         'Profilstart',
         [System.Windows.MessageBoxButton]::YesNoCancel,
